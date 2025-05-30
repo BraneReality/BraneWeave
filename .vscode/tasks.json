@@ -1,0 +1,26 @@
+{
+    "version": "2.0.0",
+    "showOutput": "always",
+    "tasks": [
+        {
+            "taskName": "cargo-build-debug",
+            "label": "cargo-build-debug",
+            "type": "shell",
+            "options": {
+                "cwd": "${workspaceRoot}"
+            },
+            "command": "cargo build",
+            "presentation": "always"
+        },
+        {
+            "taskName": "cargo-build-release",
+            "label": "cargo-build-release",
+            "type": "shell",
+            "options": {
+                "cwd": "${workspaceRoot}"
+            },
+            "command": "cargo build --release",
+            "presentation": "always"
+        }
+    ]
+}

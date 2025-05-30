@@ -1,0 +1,3 @@
+[submodule "BraneScript"]
+	path = BraneScript
+	url = https://github.com/BraneReality/BraneScript
