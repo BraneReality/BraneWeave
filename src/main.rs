@@ -1,156 +1,84 @@
-use std::{cell::RefCell, rc::Rc, sync::Arc};
+use std::sync::Arc;
 
 use raylib::prelude::*;
-use ui::{BorderSizes, TextElementContent, UIElement};
+use ui::{BorderSizes, UIElement};
 mod ui;
 
 fn create_ui(font: Arc<WeakFont>) -> UIElement {
-    let mut root = UIElement {
-        rect: Default::default(),
-        wrapped_text: None,
-        content: ui::UIContent::None,
-        layout: ui::Layout {
-            width: ui::Sizing::Fit(None),
-            height: ui::Sizing::Fit(None),
-            padding: BorderSizes::uniform(4f32),
-            spacing: 5f32,
-            direction: ui::LayoutDir::LeftRight,
-            align: ui::LayoutAlign::Center,
-        },
-        children: vec![],
-        on_event: None,
-    };
+    let mut root = UIElement::new(ui::UIContent::None)
+        .padding(BorderSizes::uniform(0f32))
+        .spacing(5f32);
 
-    let mut content = UIElement {
-        rect: Default::default(),
-        wrapped_text: None,
-        content: ui::UIContent::Rect(Color::BLUE),
-        layout: ui::Layout {
-            width: ui::Sizing::Grow(None),
-            height: ui::Sizing::Grow(None),
-            padding: BorderSizes::uniform(4f32),
-            spacing: 10f32,
-            direction: ui::LayoutDir::LeftRight,
-            align: ui::LayoutAlign::Start,
-        },
-        children: vec![],
-        on_event: None,
-    };
+    let mut content = UIElement::new(ui::UIContent::Rect(Color::BLUE))
+        .sizing(ui::Sizing::Grow(None))
+        .uniform_padding(4f32)
+        .spacing(10f32);
 
-    content.children.push(Rc::new(RefCell::new(UIElement {
-        rect: Default::default(),
-        wrapped_text: None,
-        content: ui::UIContent::Rounded {
+    content.add_child(
+        UIElement::new(ui::UIContent::Rounded {
             color: Color::RED,
             corner_radius: 10f32,
-        },
-        layout: ui::Layout {
-            width: ui::Sizing::Fixed(50f32),
-            height: ui::Sizing::Fixed(50f32),
-            padding: BorderSizes::uniform(4f32),
-            spacing: 4f32,
-            direction: ui::LayoutDir::LeftRight,
-            align: ui::LayoutAlign::Center,
-        },
-        children: vec![],
-        on_event: None,
-    })));
+        })
+        .sizing(ui::Sizing::Fixed(50f32))
+        .build(),
+    );
 
-    content.children.push(Rc::new(RefCell::new(UIElement {
-        rect: Default::default(),
-        wrapped_text: None,
-        content: ui::UIContent::Rounded {
+    content.add_child(
+        UIElement::new(ui::UIContent::Rounded {
             color: Color::GREEN,
             corner_radius: 10f32,
-        },
-        layout: ui::Layout {
-            width: ui::Sizing::Grow(Some(300f32)),
-            height: ui::Sizing::Fixed(100f32),
-            padding: BorderSizes::uniform(4f32),
-            spacing: 4f32,
-            direction: ui::LayoutDir::LeftRight,
-            align: ui::LayoutAlign::Center,
-        },
-        children: vec![],
-        on_event: None,
-    })));
+        })
+        .width(ui::Sizing::Grow(Some(300f32)))
+        .height(ui::Sizing::Fixed(100f32))
+        .build(),
+    );
 
-    let mut bar = UIElement {
-        rect: Default::default(),
-        wrapped_text: None,
-        content: ui::UIContent::Rounded {
-            color: Color::YELLOWGREEN,
-            corner_radius: 10f32,
-        },
-        layout: ui::Layout {
-            width: ui::Sizing::Grow(None),
-            height: ui::Sizing::Fit(Some(10f32)),
-            padding: BorderSizes::uniform(10f32),
-            spacing: 4f32,
-            direction: ui::LayoutDir::Ascending,
-            align: ui::LayoutAlign::Center,
-        },
-        children: vec![],
-        on_event: None,
-    };
+    let mut bar = UIElement::new(ui::UIContent::Rounded {
+        color: Color::YELLOWGREEN,
+        corner_radius: 10f32,
+    })
+    .width(ui::Sizing::Grow(None))
+    .height(ui::Sizing::Fit(Some(10f32)))
+    .spacing(4f32)
+    .uniform_padding(10f32)
+    .direction(ui::LayoutDir::Ascending)
+    .align(ui::LayoutAlign::Center);
 
-    let carmack_quote = TextElementContent {
-                color: Color::BLACK,
-                text: "Obviously, virtual reality is where I've placed my bet about the future and where the excitement is going. At this point, I could say it's almost a lock. It's going to be magical - it is magical - and great things are coming from that. Along the way, I was focused on the first-person shooters. I said we should go do something on mobile. -John Carmack".into(),
-                font_size: 20f32,
-                wrap: true,
-                font: font.clone(),
-            };
+    let mut text_container = UIElement::new(ui::UIContent::Rect(Color::MAGENTA))
+        .width(ui::Sizing::Prefer {
+            target: 600f32,
+            min: Some(150f32),
+        })
+        .uniform_padding(4f32);
+    text_container.add_child(UIElement::new_text(
+                font.clone(),
+                "Obviously, virtual reality is where I've placed my bet about the future and where the excitement is going. At this point, I could say it's almost a lock. It's going to be magical - it is magical - and great things are coming from that. Along the way, I was focused on the first-person shooters. I said we should go do something on mobile. -John Carmack".into(),
+                20f32,
+                true,
+                Color::BLACK,
+            ).build());
+    bar.add_child(text_container.build());
 
-    bar.children.push(Rc::new(RefCell::new(UIElement {
-        rect: Default::default(),
-        wrapped_text: None,
-        content: ui::UIContent::Rect(Color::MAGENTA),
-        layout: ui::Layout {
-            width: ui::Sizing::Prefer {
-                target: 600f32,
-                min: Some(150f32),
-            },
-            height: ui::Sizing::Fit(None),
-            padding: BorderSizes::uniform(4f32),
-            spacing: 0f32,
-            direction: ui::LayoutDir::LeftRight,
-            align: ui::LayoutAlign::End,
-        },
-        children: vec![Rc::new(RefCell::new(UIElement {
-            rect: Default::default(),
-            wrapped_text: None,
-            layout: ui::Layout::text_element(&carmack_quote),
-            content: ui::UIContent::Text(carmack_quote),
-            children: vec![],
-            on_event: None,
-        }))],
-        on_event: None,
-    })));
+    bar.add_child(
+        UIElement::new_text(font.clone(), "element 2".into(), 20f32, true, Color::BLACK).build(),
+    );
 
-    content.children.push(Rc::new(RefCell::new(bar)));
+    bar.add_child(
+        UIElement::new_text(font.clone(), "element 3".into(), 20f32, true, Color::BLACK).build(),
+    );
+    content.add_child(bar.build());
 
-    content.children.push(Rc::new(RefCell::new(UIElement {
-        rect: Default::default(),
-        wrapped_text: None,
-        content: ui::UIContent::Rounded {
+    content.add_child(
+        UIElement::new(ui::UIContent::Rounded {
             color: Color::RED,
             corner_radius: 10f32,
-        },
-        layout: ui::Layout {
-            width: ui::Sizing::Fixed(50f32),
-            height: ui::Sizing::Fixed(50f32),
-            padding: BorderSizes::uniform(4f32),
-            spacing: 4f32,
-            direction: ui::LayoutDir::LeftRight,
-            align: ui::LayoutAlign::Center,
-        },
-        children: vec![],
-        on_event: None,
-    })));
+        })
+        .sizing(ui::Sizing::Fixed(50f32))
+        .build(),
+    );
 
-    root.children.push(Rc::new(RefCell::new(content)));
-    root
+    root.add_child(content.build());
+    root.build()
 }
 
 fn main() {

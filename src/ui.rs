@@ -264,6 +264,37 @@ pub struct UIElement {
 }
 
 impl UIElement {
+    #[must_use]
+    pub fn new(content: UIContent) -> UIElementBuilder {
+        UIElementBuilder {
+            content,
+            width: None,
+            height: None,
+            padding: None,
+            spacing: None,
+            direction: None,
+            align: None,
+            children: Vec::default(),
+            on_event: None,
+        }
+    }
+
+    pub fn new_text(
+        font: Arc<WeakFont>,
+        text: String,
+        font_size: f32,
+        wrap: bool,
+        color: Color,
+    ) -> UIElementBuilder {
+        Self::new(UIContent::Text(TextElementContent {
+            color,
+            text,
+            font_size,
+            wrap,
+            font,
+        }))
+    }
+
     /// Update the layout for this element and all it's children
     ///
     /// Should only be called from root node
@@ -728,6 +759,114 @@ impl UIElement {
         for child in self.children.iter() {
             child.borrow().draw(d);
         }
+    }
+}
+
+pub struct UIElementBuilder {
+    content: UIContent,
+    width: Option<Sizing>,
+    height: Option<Sizing>,
+    padding: Option<BorderSizes>,
+    spacing: Option<f32>,
+    direction: Option<LayoutDir>,
+    align: Option<LayoutAlign>,
+    children: Vec<Rc<RefCell<UIElement>>>,
+    on_event: Option<Box<dyn FnMut(&mut UIElement, UIEvent) -> bool>>,
+}
+
+impl UIElementBuilder {
+    pub fn build(self) -> UIElement {
+        let layout = if let UIContent::Text(te) = &self.content {
+            Layout::text_element(te)
+        } else {
+            Layout {
+                width: self.width.unwrap_or(Sizing::Fit(None)),
+                height: self.height.unwrap_or(Sizing::Fit(None)),
+                padding: self.padding.unwrap_or(BorderSizes::uniform(0f32)),
+                spacing: self.spacing.unwrap_or(0f32),
+                direction: self.direction.unwrap_or(LayoutDir::LeftRight),
+                align: self.align.unwrap_or(LayoutAlign::Start),
+            }
+        };
+        UIElement {
+            rect: Rectangle::default(),
+            wrapped_text: None,
+            content: self.content,
+            layout,
+            children: self.children,
+            on_event: self.on_event,
+        }
+    }
+
+    /// Set both width and height to sizing
+    #[must_use]
+    pub fn sizing(mut self, sizing: Sizing) -> Self {
+        self.width = Some(sizing);
+        self.height = Some(sizing);
+        self
+    }
+
+    #[must_use]
+    pub fn width(mut self, sizing: Sizing) -> Self {
+        self.width = Some(sizing);
+        self
+    }
+
+    #[must_use]
+    pub fn height(mut self, sizing: Sizing) -> Self {
+        self.height = Some(sizing);
+        self
+    }
+
+    #[must_use]
+    pub fn padding(mut self, padding: BorderSizes) -> Self {
+        self.padding = Some(padding);
+        self
+    }
+
+    /// Set padding on all sides to the same value
+    #[must_use]
+    pub fn uniform_padding(mut self, padding: f32) -> Self {
+        self.padding = Some(BorderSizes::uniform(padding));
+        self
+    }
+
+    /// Space between child UIElements
+    #[must_use]
+    pub fn spacing(mut self, spacing: f32) -> Self {
+        self.spacing = Some(spacing);
+        self
+    }
+
+    /// Direction axis to layout children on
+    #[must_use]
+    pub fn direction(mut self, direction: LayoutDir) -> Self {
+        self.direction = Some(direction);
+        self
+    }
+
+    /// How to align chilren tangentally to the direction axis
+    #[must_use]
+    pub fn align(mut self, align: LayoutAlign) -> Self {
+        self.align = Some(align);
+        self
+    }
+
+    /// set an event handler for all UI events
+    #[must_use]
+    pub fn on_event(
+        mut self,
+        callback: impl FnMut(&mut UIElement, UIEvent) -> bool + 'static,
+    ) -> Self {
+        self.on_event = Some(Box::new(callback));
+        self
+    }
+
+    pub fn add_child(&mut self, child: UIElement) -> Weak<RefCell<UIElement>> {
+        let el = Rc::new(RefCell::new(child));
+        let ret = Rc::downgrade(&el);
+        self.children.push(el);
+        ret
     }
 }
 
