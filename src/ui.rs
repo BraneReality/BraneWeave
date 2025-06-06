@@ -41,20 +41,6 @@ pub struct UIContext {
     pub inspector_sidebar: InspectorSidebarUI,
 }
 
-/// Allignment along an axis
-#[derive(Copy, Clone)]
-pub enum TextAlign {
-    TopLeft,
-    TopCenter,
-    TopRight,
-    CenterLeft,
-    Center,
-    CenterRight,
-    BottomLeft,
-    BottomCenter,
-    BottomRight,
-}
-
 /// How to draw this particular element
 /// every type of draw is contained in this enum,
 /// all more complicated draw types are composed of multiple UIElements
@@ -67,13 +53,16 @@ pub enum UIContent {
     /// Rect with round corners
     Rounded { color: Color, corner_radius: f32 },
     /// Text
-    Text {
-        color: Color,
-        text: String,
-        align: TextAlign,
-        font_size: f32,
-        font: Arc<WeakFont>,
-    },
+    Text(TextElementContent),
+}
+
+#[derive(Clone)]
+pub struct TextElementContent {
+    pub color: Color,
+    pub text: String,
+    pub font_size: f32,
+    pub wrap: bool,
+    pub font: Arc<WeakFont>,
 }
 
 #[derive(Clone, Copy)]
@@ -84,7 +73,7 @@ pub enum UIEvent {
 }
 
 /// Layout sizing options
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum Sizing {
     /// Retain an exact size
     Fixed(f32),
@@ -217,6 +206,29 @@ pub struct Layout {
 }
 
 impl Layout {
+    pub fn text_element(text: &TextElementContent) -> Layout {
+        let target = text.font.measure_text(&text.text, text.font_size, 1f32).x;
+        let segments = text.text.split([' ']);
+        let min = segments.into_iter().fold(None, |largest, seg| {
+            Some(
+                largest
+                    .unwrap_or(0f32)
+                    .max(text.font.measure_text(&seg, text.font_size, 1f32).x),
+            )
+        });
+        let sizing = Sizing::Prefer { target, min };
+        println!("Computed text layout: {:?}", sizing);
+
+        Layout {
+            width: sizing,
+            height: Sizing::Fit(None),
+            padding: BorderSizes::uniform(2f32),
+            spacing: 4f32,
+            direction: LayoutDir::LeftRight,
+            align: LayoutAlign::Center,
+        }
+    }
+
     fn axis_width(&self, dir: LayoutDir) -> Sizing {
         match dir {
             LayoutDir::LeftRight | LayoutDir::RightLeft => self.width,
@@ -238,12 +250,13 @@ pub struct UIElement {
     /// this generally should not be set directly as it gets overwritten by compute_layout()
     /// influence this through layout instead
     pub rect: Rectangle,
+    pub wrapped_text: Option<String>,
     /// What this element renders
     pub content: UIContent,
     /// The layout options for this element
     pub layout: Layout,
     /// elements to render within this one
-    pub children: Vec<UIElement>,
+    pub children: Vec<Rc<RefCell<UIElement>>>,
     /// Subscribe to all events, function is expectd to self-filter and return true to
     /// indicate that an event is consumed.
     /// Events start at children and propigate upwards
@@ -257,7 +270,7 @@ impl UIElement {
     pub fn compute_layout(&mut self) {
         self.compute_fit_widths();
         self.compute_dynamic_widths();
-        //self.compute_text_wrap();
+        self.compute_text_wrap();
         self.compute_fit_heights();
         self.compute_dynamic_heights();
         self.compute_positions();
@@ -300,26 +313,26 @@ impl UIElement {
 
     fn compute_fit_size(&mut self, axis: LayoutDir) {
         for child in self.children.iter_mut() {
-            child.compute_fit_size(axis);
+            child.borrow_mut().compute_fit_size(axis);
         }
 
         let layout = &self.layout;
         let width = Self::axis_width_mut(&mut self.rect, axis);
 
         let mut const_width = layout.padding.axis_width(axis);
-        if let UIContent::Text {
-            color: _,
-            text,
-            align: _,
-            font_size,
-            font,
-        } = &self.content
-        {
-            let text_size = font.measure_text(text, *font_size, 1f32);
+        if let UIContent::Text(te) = &self.content {
             if axis.is_axis_same(LayoutDir::LeftRight) {
-                const_width += text_size.x
+                if !te.wrap {
+                    let text_size = te.font.measure_text(&te.text, te.font_size, 1f32);
+                    const_width += text_size.x;
+                }
             } else {
-                const_width += text_size.y
+                let text_size = te.font.measure_text(
+                    self.wrapped_text.as_ref().unwrap_or(&te.text),
+                    te.font_size,
+                    1f32,
+                );
+                const_width += text_size.y;
             }
         }
 
@@ -331,13 +344,13 @@ impl UIElement {
                 if layout.direction.is_axis_same(axis) {
                     *width = const_width;
                     for child in self.children.iter() {
-                        *width += Self::axis_width(&child.rect, axis);
+                        *width += Self::axis_width(&child.borrow().rect, axis);
                     }
                     *width += (self.children.len() as f32 - 1f32).max(0f32) * layout.spacing;
                 } else {
                     *width = 0f32;
                     for child in self.children.iter() {
-                        *width = width.max(Self::axis_width(&child.rect, axis));
+                        *width = width.max(Self::axis_width(&child.borrow().rect, axis));
                     }
                     *width += const_width;
                 }
@@ -345,7 +358,10 @@ impl UIElement {
                     *width = width.max(min);
                 }
             }
-            Sizing::Grow(_) | Sizing::Prefer { target: _, min: _ } => (), // Computed later
+            Sizing::Grow(_) => (), // Computed
+            Sizing::Prefer { target: _, min } => {
+                *width = const_width + min.unwrap_or(0f32);
+            }
         }
     }
 
@@ -363,16 +379,23 @@ impl UIElement {
 
         if !self.layout.direction.is_axis_same(axis) {
             for child in self.children.iter_mut() {
-                match child.layout.axis_width(axis) {
+                let mut child = child.borrow_mut();
+                let sizing = child.layout.axis_width(axis);
+                println!("tangent sizing for child: {:?}", sizing);
+                match sizing {
                     Sizing::Fixed(_) => (),
                     Sizing::Fit(_) => (),
                     Sizing::Grow(min) => {
                         let width = Self::axis_width_mut(&mut child.rect, axis);
                         *width = remaining_width.max(min.unwrap_or(0f32));
                     }
-                    Sizing::Prefer { target, min: _ } => {
+                    Sizing::Prefer { target, min } => {
                         let width = Self::axis_width_mut(&mut child.rect, axis);
-                        *width = target.min(remaining_width);
+                        println!(
+                            "computing prefered height. prefered={}, remaining={}",
+                            target, remaining_width
+                        );
+                        *width = target.min(remaining_width).max(min.unwrap_or(0f32));
                     }
                 }
             }
@@ -381,40 +404,43 @@ impl UIElement {
         remaining_width -= (self.children.len() as f32 - 1f32).max(0f32) * self.layout.spacing;
 
         // I'm doing this in this super convoluted way to test out how it might look ported to BraneScript, because of functional programming things
-        let child_count = self.children.len();
         let (mut remaining_width, mut grow_children, mut shrink_children) =
-            self.children.iter_mut().fold(
+            self.children.iter().fold(
                 (remaining_width, Vec::new(), Vec::new()),
-                |(remaining_width, mut grow, mut shrink), child| match child.layout.axis_width(axis)
-                {
-                    Sizing::Fixed(size) => (remaining_width - size, grow, shrink),
-                    Sizing::Fit(_) => (
-                        remaining_width - Self::axis_width(&child.rect, axis),
-                        grow,
-                        shrink,
-                    ),
-                    Sizing::Grow(_) => {
-                        *Self::axis_width_mut(&mut child.rect, axis) = 0f32;
-                        grow.push(child);
-                        (remaining_width, grow, shrink)
-                    }
-                    Sizing::Prefer { target, min: _ } => {
-                        *Self::axis_width_mut(&mut child.rect, axis) = target;
-                        shrink.push(child);
-                        (remaining_width - target, grow, shrink)
+                |(remaining_width, mut grow, mut shrink), child| {
+                    let sizing = child.borrow().layout.axis_width(axis);
+                    println!("axis sizing for child: {:?}", sizing);
+                    match sizing {
+                        Sizing::Fixed(size) => (remaining_width - size, grow, shrink),
+                        Sizing::Fit(_) => (
+                            remaining_width - Self::axis_width(&child.borrow().rect, axis),
+                            grow,
+                            shrink,
+                        ),
+                        Sizing::Grow(_) => {
+                            *Self::axis_width_mut(&mut child.borrow_mut().rect, axis) = 0f32;
+                            grow.push(child.clone());
+                            (remaining_width, grow, shrink)
+                        }
+                        Sizing::Prefer { target, min: _ } => {
+                            println!("adding shrink element");
+                            *Self::axis_width_mut(&mut child.borrow_mut().rect, axis) = target;
+                            shrink.push(child.clone());
+                            (remaining_width - target, grow, shrink)
+                        }
                     }
                 },
             );
 
-        while !grow_children.is_empty() && remaining_width > 0f32 {
+        while !grow_children.is_empty() && remaining_width > 0.001f32 {
             let (smallest, _, width_to_add) = grow_children.iter().fold(
                 (
-                    Self::axis_width(&grow_children[0].rect, axis),
+                    Self::axis_width(&grow_children[0].borrow().rect, axis),
                     f32::INFINITY,
                     remaining_width,
                 ),
                 |(smallest, second_smallest, wta), child| {
-                    let width = Self::axis_width(&child.rect, axis);
+                    let width = Self::axis_width(&child.borrow().rect, axis);
                     if width < smallest {
                         (width, smallest, wta)
                     } else if width > smallest {
@@ -433,17 +459,17 @@ impl UIElement {
 
             grow_children = grow_children
                 .into_iter()
-                .filter_map(|child: &mut UIElement| {
-                    let width = Self::axis_width(&child.rect, axis);
+                .filter_map(|child| {
+                    let width = Self::axis_width(&child.borrow().rect, axis);
                     if width != smallest {
-                        return Some(child);
+                        return Some(child.clone());
                     }
-                    let max_width = match child.layout.axis_width(axis) {
+                    let max_width = match child.borrow().layout.axis_width(axis) {
                         Sizing::Grow(max) => max.unwrap_or(f32::INFINITY),
                         _ => unreachable!(),
                     };
-                    let rect = &mut child.rect;
-                    let width = Self::axis_width_mut(rect, axis);
+                    let mut c = child.borrow_mut();
+                    let width = Self::axis_width_mut(&mut c.rect, axis);
                     let old_width = *width;
 
                     *width += width_to_add;
@@ -451,21 +477,26 @@ impl UIElement {
                     if bound_hit {
                         *width = max_width;
                     }
+
                     remaining_width -= *width - old_width;
-                    if bound_hit { None } else { Some(child) }
+                    if bound_hit { None } else { Some(child.clone()) }
                 })
                 .collect();
         }
 
-        while !shrink_children.is_empty() && remaining_width < 0f32 {
+        if !shrink_children.is_empty() {
+            println!("shrinkable elements, remaining width: {}", remaining_width)
+        }
+
+        while !shrink_children.is_empty() && remaining_width < -0.001f32 {
             let (largest, _, width_to_add) = shrink_children.iter().fold(
                 (
-                    Self::axis_width(&shrink_children[0].rect, axis),
+                    Self::axis_width(&shrink_children[0].borrow().rect, axis),
                     0f32,
                     remaining_width,
                 ),
                 |(largest, second_largest, wta), child| {
-                    let width = Self::axis_width(&child.rect, axis);
+                    let width = Self::axis_width(&child.borrow().rect, axis);
                     if width > largest {
                         (width, largest, wta)
                     } else if width < largest {
@@ -481,15 +512,20 @@ impl UIElement {
             shrink_children = shrink_children
                 .into_iter()
                 .filter_map(|child| {
-                    let width = Self::axis_width(&child.rect, axis);
+                    let width = Self::axis_width(&child.borrow().rect, axis);
                     if width != largest {
-                        return Some(child);
+                        println!(
+                            "skipping shrink for child with size {} needed {}",
+                            width, largest
+                        );
+                        return Some(child.clone());
                     }
-                    let min_width = match child.layout.axis_width(axis) {
+                    let min_width = match child.borrow().layout.axis_width(axis) {
                         Sizing::Prefer { target: _, min } => min.unwrap_or(0f32),
                         _ => unreachable!(),
                     };
-                    let width = Self::axis_width_mut(&mut child.rect, axis);
+                    let mut c = child.borrow_mut();
+                    let width = Self::axis_width_mut(&mut c.rect, axis);
                     let old_width = *width;
 
                     *width += width_to_add;
@@ -497,24 +533,103 @@ impl UIElement {
                     if bound_hit {
                         *width = min_width;
                     }
+                    println!(
+                        "shrinking {} to {}, remaining was {} is now {}",
+                        old_width,
+                        *width,
+                        remaining_width,
+                        remaining_width - (*width - old_width)
+                    );
                     remaining_width -= *width - old_width;
-                    if bound_hit { None } else { Some(child) }
+                    if bound_hit { None } else { Some(child.clone()) }
                 })
                 .collect();
         }
     }
 
     fn compute_dynamic_widths(&mut self) {
+        println!("computing dynamic child widths");
         self.compute_dynamic_size(LayoutDir::LeftRight);
         for child in self.children.iter_mut() {
-            child.compute_dynamic_size(LayoutDir::LeftRight);
+            println!("walking child node");
+            child.borrow_mut().compute_dynamic_widths();
         }
     }
 
     fn compute_dynamic_heights(&mut self) {
+        println!("computing dynamic child heights");
         self.compute_dynamic_size(LayoutDir::Decending);
         for child in self.children.iter_mut() {
-            child.compute_dynamic_size(LayoutDir::Decending);
+            println!("walking child node");
+            child.borrow_mut().compute_dynamic_heights();
+        }
+    }
+
+    fn compute_text_wrap(&mut self) {
+        for child in self.children.iter() {
+            child.borrow_mut().compute_text_wrap();
+        }
+
+        if let UIContent::Text(te) = &self.content {
+            if !te.wrap {
+                return;
+            }
+            let max_width = self.rect.width;
+
+            let mut break_start = 0;
+            let mut wrapped_text = String::new();
+            for i in 0..te.text.len() {
+                if break_start > (i + 1) {
+                    continue;
+                }
+                let line = &te.text[break_start..(i + 1)];
+                let width = te.font.measure_text(line, te.font_size, 1f32).x;
+                if width > max_width {
+                    let mut break_end = i;
+                    let mut next_break_start = i;
+                    let can_break;
+                    loop {
+                        let c = te.text.chars().nth(break_end).unwrap();
+                        if c == ' ' {
+                            next_break_start = break_end + 1;
+                            can_break = true;
+                            break;
+                        }
+                        if c == '-' && break_end != i {
+                            break_end = (break_end + 1).min(te.text.len());
+                            next_break_start = break_end;
+                            can_break = true;
+                            break;
+                        }
+                        if break_end == 0 {
+                            break_end = break_start;
+                            can_break = false;
+                            break;
+                        }
+                        break_end -= 1;
+                    }
+                    if can_break && break_end > break_start {
+                        if wrapped_text.is_empty() {
+                            wrapped_text = (&te.text[break_start..break_end]).into();
+                        } else {
+                            wrapped_text =
+                                format!("{}\n{}", wrapped_text, &te.text[break_start..break_end]);
+                        }
+                        break_start = next_break_start;
+                    }
+                }
+            }
+
+            let rem = &te.text[break_start..te.text.len()];
+            if rem.len() > 0 {
+                wrapped_text = format!("{}\n{}", wrapped_text, rem);
+            }
+
+            if wrapped_text.is_empty() {
+                self.wrapped_text = None;
+            } else {
+                self.wrapped_text = Some(wrapped_text);
+            }
         }
     }
 
@@ -527,9 +642,10 @@ impl UIElement {
                     *Self::axis_pos(&mut self.rect, dir).0 + self.layout.padding.axis_start(dir);
                 let y_pos = *Self::axis_pos(&mut self.rect, dir).1;
                 for child in self.children.iter_mut() {
-                    let height = Self::axis_height(&child.rect, dir);
-                    let width = Self::axis_width(&child.rect, dir);
-                    let (x, y) = Self::axis_pos(&mut child.rect, dir);
+                    let height = Self::axis_height(&child.borrow().rect, dir);
+                    let width = Self::axis_width(&child.borrow().rect, dir);
+                    let mut c = child.borrow_mut();
+                    let (x, y) = Self::axis_pos(&mut c.rect, dir);
                     *x = last_x_pos;
                     last_x_pos += width + self.layout.spacing;
 
@@ -554,9 +670,10 @@ impl UIElement {
                     *Self::axis_pos(&mut self.rect, dir).0 + self.layout.padding.axis_end(dir);
                 let y_pos = *Self::axis_pos(&mut self.rect, dir).1;
                 for child in self.children.iter_mut().rev() {
-                    let height = Self::axis_height(&child.rect, dir);
-                    let width = Self::axis_width(&child.rect, dir);
-                    let (x, y) = Self::axis_pos(&mut child.rect, dir);
+                    let height = Self::axis_height(&child.borrow().rect, dir);
+                    let width = Self::axis_width(&child.borrow().rect, dir);
+                    let mut c = child.borrow_mut();
+                    let (x, y) = Self::axis_pos(&mut c.rect, dir);
                     *x = last_x_pos;
                     last_x_pos += width + self.layout.spacing;
 
@@ -579,7 +696,7 @@ impl UIElement {
         };
 
         for child in self.children.iter_mut() {
-            child.compute_positions();
+            child.borrow_mut().compute_positions();
         }
     }
 
@@ -596,26 +713,20 @@ impl UIElement {
                 5,
                 color,
             ),
-            UIContent::Text {
-                color,
-                text,
-                align,
-                font_size,
-                font, // TODO alignment and wrapping
-            } => d.draw_text_ex(
-                font.as_ref(),
-                &text,
+            UIContent::Text(te) => d.draw_text_ex(
+                te.font.as_ref(),
+                self.wrapped_text.as_ref().unwrap_or(&te.text),
                 Vector2::new(
                     self.rect.x + self.layout.padding.left,
                     self.rect.y + self.layout.padding.top,
                 ),
-                *font_size,
+                te.font_size,
                 1f32,
-                color,
+                te.color,
             ),
         }
         for child in self.children.iter() {
-            child.draw(d);
+            child.borrow().draw(d);
         }
     }
 }
