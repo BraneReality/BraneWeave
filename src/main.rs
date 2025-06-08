@@ -1,85 +1,10 @@
-use std::sync::Arc;
+use std::{cell::RefCell, ops::DerefMut, sync::Arc};
 
+use branec::hir::{self, Block, BlockSig, Item, Project};
 use raylib::prelude::*;
-use ui::{BorderSizes, UIElement};
+use ui::UIContext;
+//mod bindings;
 mod ui;
-
-fn create_ui(font: Arc<WeakFont>) -> UIElement {
-    let mut root = UIElement::new(ui::UIContent::None)
-        .padding(BorderSizes::uniform(0f32))
-        .spacing(5f32);
-
-    let mut content = UIElement::new(ui::UIContent::Rect(Color::BLUE))
-        .sizing(ui::Sizing::Grow(None))
-        .uniform_padding(4f32)
-        .spacing(10f32);
-
-    content.add_child(
-        UIElement::new(ui::UIContent::Rounded {
-            color: Color::RED,
-            corner_radius: 10f32,
-        })
-        .sizing(ui::Sizing::Fixed(50f32))
-        .build(),
-    );
-
-    content.add_child(
-        UIElement::new(ui::UIContent::Rounded {
-            color: Color::GREEN,
-            corner_radius: 10f32,
-        })
-        .width(ui::Sizing::Grow(Some(300f32)))
-        .height(ui::Sizing::Fixed(100f32))
-        .build(),
-    );
-
-    let mut bar = UIElement::new(ui::UIContent::Rounded {
-        color: Color::YELLOWGREEN,
-        corner_radius: 10f32,
-    })
-    .width(ui::Sizing::Grow(None))
-    .height(ui::Sizing::Fit(Some(10f32)))
-    .spacing(4f32)
-    .uniform_padding(10f32)
-    .direction(ui::LayoutDir::Ascending)
-    .align(ui::LayoutAlign::Center);
-
-    let mut text_container = UIElement::new(ui::UIContent::Rect(Color::MAGENTA))
-        .width(ui::Sizing::Prefer {
-            target: 600f32,
-            min: Some(150f32),
-        })
-        .uniform_padding(4f32);
-    text_container.add_child(UIElement::new_text(
-                font.clone(),
-                "Obviously, virtual reality is where I've placed my bet about the future and where the excitement is going. At this point, I could say it's almost a lock. It's going to be magical - it is magical - and great things are coming from that. Along the way, I was focused on the first-person shooters. I said we should go do something on mobile. -John Carmack".into(),
-                20f32,
-                true,
-                Color::BLACK,
-            ).build());
-    bar.add_child(text_container.build());
-
-    bar.add_child(
-        UIElement::new_text(font.clone(), "element 2".into(), 20f32, true, Color::BLACK).build(),
-    );
-
-    bar.add_child(
-        UIElement::new_text(font.clone(), "element 3".into(), 20f32, true, Color::BLACK).build(),
-    );
-    content.add_child(bar.build());
-
-    content.add_child(
-        UIElement::new(ui::UIContent::Rounded {
-            color: Color::RED,
-            corner_radius: 10f32,
-        })
-        .sizing(ui::Sizing::Fixed(50f32))
-        .build(),
-    );
-
-    root.add_child(content.build());
-    root.build()
-}
 
 fn main() {
     let (mut rl, thread) = raylib::init()
@@ -90,34 +15,71 @@ fn main() {
     // TODO find host refresh rate
     rl.set_target_fps(60);
 
-    //let mut proj = ProjectCtx::default();
+    let proj = Arc::new(RefCell::new(Project::new()));
+    let graph = {
+        let mut proj = proj.borrow_mut();
+        let graph_id = proj.new_graph();
+        let graph = proj.graph_mut(graph_id).unwrap();
+        let sig = hir::BlockSig {
+            inputs: vec![(), ()],
+            outputs: vec![()],
+        };
 
-    /*let mut ctx = UIContext::new();
-    ctx.node_graph.new_node();
-    ctx.node_graph.new_node();
-    ctx.node_graph.new_node();
-    ctx.node_graph.new_node();*/
+        let body = graph.create_block();
 
-    let standard_font = rl
-        .load_font_ex(
-            &thread,
-            "fonts/JetBrains/JetBrainsMonoNerdFont-Bold.ttf",
-            20,
-            None,
-        )
-        .expect("Couldn't find font");
+        let main_fn = graph.add_fn("main".into(), sig, body);
 
-    let font_handle = Arc::new(standard_font.make_weak());
-    let mut root = create_ui(font_handle.clone());
+        let block = graph.block_mut(body).unwrap();
+
+        block
+            .outputs
+            .push(hir::LocalValue::NodeOutput { node: 2, index: 0 });
+
+        block.nodes.insert(
+            0,
+            hir::Node {
+                inputs: vec![hir::LocalValue::BlockInput { index: 0 }],
+                expr: hir::DefId {
+                    graph: 1,
+                    item: main_fn,
+                },
+            },
+        );
+
+        block.nodes.insert(
+            1,
+            hir::Node {
+                inputs: vec![hir::LocalValue::BlockInput { index: 1 }],
+                expr: hir::DefId {
+                    graph: 1,
+                    item: main_fn,
+                },
+            },
+        );
+
+        block.nodes.insert(
+            2,
+            hir::Node {
+                inputs: vec![
+                    hir::LocalValue::NodeOutput { node: 0, index: 0 },
+                    hir::LocalValue::NodeOutput { node: 1, index: 0 },
+                ],
+                expr: hir::DefId {
+                    graph: 1,
+                    item: main_fn,
+                },
+            },
+        );
+
+        graph_id
+    };
+
+    let mut ctx = UIContext::new(&mut rl, &thread, graph, proj);
 
     while !rl.window_should_close() {
         let mut d = rl.begin_drawing(&thread);
         d.clear_background(Color::BLACK);
-        //ctx.draw(&mut d, &mut proj);
-        root.layout.width = ui::Sizing::Fixed(d.get_render_width() as f32);
-        root.layout.height = ui::Sizing::Fixed(d.get_render_height() as f32);
-        root.compute_layout();
-        root.draw(&mut d);
+        ctx.draw(&mut d);
         d.draw_fps(12, 12);
     }
 }

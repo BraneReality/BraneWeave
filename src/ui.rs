@@ -1,45 +1,12 @@
-use branec::ProjectCtx;
+use branec::{hir, queries};
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::HashMap,
     rc::{Rc, Weak},
     sync::Arc,
 };
 
 use raylib::prelude::*;
-
-const GRAPH_BACKGROUND: Color = Color {
-    r: 25,
-    g: 77,
-    b: 51,
-    a: 255,
-};
-const GUI_BACKGROUND: Color = Color {
-    r: 32,
-    g: 96,
-    b: 32,
-    a: 255,
-};
-
-const BORDER_COLOR: Color = Color {
-    r: 64,
-    g: 191,
-    b: 128,
-    a: 255,
-};
-
-const DRAG_BORDER_WIDTH: i32 = 4i32;
-
-trait UIClickable {
-    fn consume_mouse_down(&mut self, click_pos: Vector2, d: &RaylibDrawHandle) -> bool;
-    fn consume_mouse_up(&mut self, click_pos: Vector2, d: &RaylibDrawHandle) -> bool;
-}
-
-pub struct UIContext {
-    pub add_node_popup: Option<()>,
-    pub node_graph: NodeGraphUI,
-    pub inspector_sidebar: InspectorSidebarUI,
-}
 
 /// How to draw this particular element
 /// every type of draw is contained in this enum,
@@ -65,11 +32,11 @@ pub struct TextElementContent {
     pub font: Arc<WeakFont>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum UIEvent {
     MouseDown,
     MouseUp,
-    MouseDrag,
+    MouseDrag(Vector2),
 }
 
 /// Layout sizing options
@@ -217,7 +184,6 @@ impl Layout {
             )
         });
         let sizing = Sizing::Prefer { target, min };
-        println!("Computed text layout: {:?}", sizing);
 
         Layout {
             width: sizing,
@@ -260,7 +226,7 @@ pub struct UIElement {
     /// Subscribe to all events, function is expectd to self-filter and return true to
     /// indicate that an event is consumed.
     /// Events start at children and propigate upwards
-    pub on_event: Option<Box<dyn FnMut(&mut Self, UIEvent) -> bool>>,
+    pub on_event: Option<Box<dyn FnMut(UIEvent, bool) -> bool>>,
 }
 
 impl UIElement {
@@ -412,7 +378,6 @@ impl UIElement {
             for child in self.children.iter_mut() {
                 let mut child = child.borrow_mut();
                 let sizing = child.layout.axis_width(axis);
-                println!("tangent sizing for child: {:?}", sizing);
                 match sizing {
                     Sizing::Fixed(_) => (),
                     Sizing::Fit(_) => (),
@@ -422,10 +387,6 @@ impl UIElement {
                     }
                     Sizing::Prefer { target, min } => {
                         let width = Self::axis_width_mut(&mut child.rect, axis);
-                        println!(
-                            "computing prefered height. prefered={}, remaining={}",
-                            target, remaining_width
-                        );
                         *width = target.min(remaining_width).max(min.unwrap_or(0f32));
                     }
                 }
@@ -440,7 +401,6 @@ impl UIElement {
                 (remaining_width, Vec::new(), Vec::new()),
                 |(remaining_width, mut grow, mut shrink), child| {
                     let sizing = child.borrow().layout.axis_width(axis);
-                    println!("axis sizing for child: {:?}", sizing);
                     match sizing {
                         Sizing::Fixed(size) => (remaining_width - size, grow, shrink),
                         Sizing::Fit(_) => (
@@ -454,7 +414,6 @@ impl UIElement {
                             (remaining_width, grow, shrink)
                         }
                         Sizing::Prefer { target, min: _ } => {
-                            println!("adding shrink element");
                             *Self::axis_width_mut(&mut child.borrow_mut().rect, axis) = target;
                             shrink.push(child.clone());
                             (remaining_width - target, grow, shrink)
@@ -515,10 +474,6 @@ impl UIElement {
                 .collect();
         }
 
-        if !shrink_children.is_empty() {
-            println!("shrinkable elements, remaining width: {}", remaining_width)
-        }
-
         while !shrink_children.is_empty() && remaining_width < -0.001f32 {
             let (largest, _, width_to_add) = shrink_children.iter().fold(
                 (
@@ -545,10 +500,6 @@ impl UIElement {
                 .filter_map(|child| {
                     let width = Self::axis_width(&child.borrow().rect, axis);
                     if width != largest {
-                        println!(
-                            "skipping shrink for child with size {} needed {}",
-                            width, largest
-                        );
                         return Some(child.clone());
                     }
                     let min_width = match child.borrow().layout.axis_width(axis) {
@@ -564,13 +515,6 @@ impl UIElement {
                     if bound_hit {
                         *width = min_width;
                     }
-                    println!(
-                        "shrinking {} to {}, remaining was {} is now {}",
-                        old_width,
-                        *width,
-                        remaining_width,
-                        remaining_width - (*width - old_width)
-                    );
                     remaining_width -= *width - old_width;
                     if bound_hit { None } else { Some(child.clone()) }
                 })
@@ -579,19 +523,15 @@ impl UIElement {
     }
 
     fn compute_dynamic_widths(&mut self) {
-        println!("computing dynamic child widths");
         self.compute_dynamic_size(LayoutDir::LeftRight);
         for child in self.children.iter_mut() {
-            println!("walking child node");
             child.borrow_mut().compute_dynamic_widths();
         }
     }
 
     fn compute_dynamic_heights(&mut self) {
-        println!("computing dynamic child heights");
         self.compute_dynamic_size(LayoutDir::Decending);
         for child in self.children.iter_mut() {
-            println!("walking child node");
             child.borrow_mut().compute_dynamic_heights();
         }
     }
@@ -760,6 +700,43 @@ impl UIElement {
             child.borrow().draw(d);
         }
     }
+
+    // Return all chilren that have an event listener
+    pub fn get_event_targets(&self, targets: &mut Vec<(UIRef, bool)>, pos: Option<Vector2>) {
+        for child in self.children.iter() {
+            let c = child.borrow();
+
+            c.get_event_targets(targets, pos);
+            if let Some(_) = &c.on_event {
+                targets.push((
+                    child.clone(),
+                    if let Some(pos) = pos {
+                        c.rect.check_collision_point_rec(pos)
+                    } else {
+                        false
+                    },
+                ));
+            }
+        }
+    }
+
+    pub fn send_event(&self, event: UIEvent, pos: Option<Vector2>) -> bool {
+        // TEMPORARY SOLUTION
+        let mut targets = Vec::new();
+        self.get_event_targets(&mut targets, pos);
+        println!("set event {:?}", event);
+
+        for target in targets {
+            let mut callback = { target.0.borrow_mut().on_event.take() }.unwrap();
+            let consumed = (callback)(event, target.1);
+            target.0.borrow_mut().on_event = Some(callback);
+            if consumed {
+                println!("consumed event");
+                return true;
+            }
+        }
+        false
+    }
 }
 
 pub struct UIElementBuilder {
@@ -771,7 +748,7 @@ pub struct UIElementBuilder {
     direction: Option<LayoutDir>,
     align: Option<LayoutAlign>,
     children: Vec<Rc<RefCell<UIElement>>>,
-    on_event: Option<Box<dyn FnMut(&mut UIElement, UIEvent) -> bool>>,
+    on_event: Option<Box<dyn FnMut(UIEvent, bool) -> bool>>,
 }
 
 impl UIElementBuilder {
@@ -854,263 +831,567 @@ impl UIElementBuilder {
 
     /// set an event handler for all UI events
     #[must_use]
-    pub fn on_event(
-        mut self,
-        callback: impl FnMut(&mut UIElement, UIEvent) -> bool + 'static,
-    ) -> Self {
+    pub fn on_event(mut self, callback: impl FnMut(UIEvent, bool) -> bool + 'static) -> Self {
         self.on_event = Some(Box::new(callback));
         self
     }
 
-    pub fn add_child(&mut self, child: UIElement) -> Weak<RefCell<UIElement>> {
+    pub fn add_child(&mut self, child: UIElement) -> WeakUIRef {
         let el = Rc::new(RefCell::new(child));
         let ret = Rc::downgrade(&el);
         self.children.push(el);
         ret
     }
+
+    pub fn add_child_ref(&mut self, child: UIRef) {
+        self.children.push(child);
+    }
+}
+
+type WeakUIRef = Weak<RefCell<UIElement>>;
+type UIRef = Rc<RefCell<UIElement>>;
+
+#[allow(unused)]
+pub mod style {
+    use std::{
+        cell::LazyCell,
+        rc::Rc,
+        sync::{Arc, LazyLock, RwLock},
+    };
+
+    use raylib::{color::Color, text::WeakFont};
+
+    pub const TEXT: Color = Color::new(255, 255, 255, 255);
+    pub const TEXT_DISABLED: Color = Color::new(128, 128, 128, 255);
+    pub const WINDOW_BG: Color = Color::new(15, 15, 15, 240);
+    pub const CHILD_BG: Color = Color::new(0, 0, 0, 0);
+    pub const POPUP_BG: Color = Color::new(20, 20, 20, 240);
+    pub const BORDER: Color = Color::new(110, 128, 110, 128);
+    pub const BORDER_SHADOW: Color = Color::new(0, 0, 0, 0);
+    pub const FRAME_BG: Color = Color::new(41, 122, 74, 138);
+    pub const FRAME_BG_HOVERED: Color = Color::new(66, 250, 151, 102);
+    pub const FRAME_BG_ACTIVE: Color = Color::new(66, 250, 151, 171);
+    pub const TITLE_BG: Color = Color::new(10, 10, 10, 255);
+    pub const TITLE_BG_ACTIVE: Color = Color::new(41, 122, 74, 255);
+    pub const TITLE_BG_COLLAPSED: Color = Color::new(0, 0, 0, 130);
+    pub const MENU_BAR_BG: Color = Color::new(36, 36, 36, 255);
+    pub const SCROLLBAR_BG: Color = Color::new(5, 5, 5, 135);
+    pub const SCROLLBAR_GRAB: Color = Color::new(79, 79, 79, 255);
+    pub const SCROLLBAR_GRAB_HOVERED: Color = Color::new(104, 104, 104, 255);
+    pub const SCROLLBAR_GRAB_ACTIVE: Color = Color::new(130, 130, 130, 255);
+    pub const CHECK_MARK: Color = Color::new(66, 250, 151, 255);
+    pub const SLIDER_GRAB: Color = Color::new(61, 224, 133, 255);
+    pub const SLIDER_GRAB_ACTIVE: Color = Color::new(66, 250, 151, 255);
+    pub const BUTTON: Color = Color::new(66, 250, 151, 255);
+    pub const BUTTON_HOVERED: Color = Color::new(66, 250, 151, 179);
+    pub const BUTTON_ACTIVE: Color = Color::new(15, 250, 135, 255);
+    pub const HEADER: Color = Color::new(66, 250, 151, 79);
+    pub const HEADER_HOVERED: Color = Color::new(66, 250, 151, 102);
+    pub const HEADER_ACTIVE: Color = Color::new(66, 250, 151, 255);
+    pub const SEPARATOR: Color = BORDER;
+    pub const SEPARATOR_HOVERED: Color = Color::new(26, 191, 102, 199);
+    pub const SEPARATOR_ACTIVE: Color = Color::new(26, 191, 102, 255);
+    pub const RESIZE_GRIP: Color = Color::new(66, 250, 151, 51);
+    pub const RESIZE_GRIP_HOVERED: Color = Color::new(66, 250, 151, 171);
+    pub const RESIZE_GRIP_ACTIVE: Color = Color::new(66, 250, 151, 242);
+    // Complex ImLerp-based TAB colors omitted — can be interpolated in code
+    pub const DOCKING_EMPTY_BG: Color = Color::new(51, 51, 51, 255);
+    pub const PLOT_LINES: Color = Color::new(156, 156, 156, 255);
+    pub const PLOT_LINES_HOVERED: Color = Color::new(255, 110, 89, 255);
+    pub const PLOT_HISTOGRAM: Color = Color::new(230, 179, 0, 255);
+    pub const PLOT_HISTOGRAM_HOVERED: Color = Color::new(255, 153, 0, 255);
+    pub const TABLE_HEADER_BG: Color = Color::new(48, 51, 48, 255);
+    pub const TABLE_BORDER_STRONG: Color = Color::new(79, 89, 79, 255);
+    pub const TABLE_BORDER_LIGHT: Color = Color::new(58, 64, 58, 255);
+    pub const TABLE_ROW_BG: Color = Color::new(0, 0, 0, 0);
+    pub const TABLE_ROW_BG_ALT: Color = Color::new(255, 255, 255, 15);
+    pub const TEXT_SELECTED_BG: Color = Color::new(66, 250, 151, 89);
+    pub const DRAG_DROP_TARGET: Color = Color::new(51, 255, 51, 230);
+    pub const NAV_HIGHLIGHT: Color = Color::new(66, 250, 151, 255);
+    pub const NAV_WINDOWING_HIGHLIGHT: Color = Color::new(255, 255, 255, 179);
+    pub const NAV_WINDOWING_DIM_BG: Color = Color::new(50, 50, 50, 255);
+    pub const MODAL_WINDOW_DIM_BG: Color = Color::new(204, 204, 204, 89);
+
+    pub const FN_BACKGROUND: Color = Color::new(77, 145, 255, 255);
+}
+
+pub enum FollowMode {
+    // Smoothly move towards target element
+    Smooth(f32),
+    // No smoothing
+    Snap,
+}
+
+pub struct PlaceholderUI {
+    pub position: WeakUIRef,
+    pub content: WeakUIRef,
+    pub follow_mode: FollowMode,
+}
+
+pub struct UIContext {
+    pub project: Arc<RefCell<hir::Project>>,
+    pub graph: hir::GraphId,
+
+    pub root: UIElement,
+    pub graph_content: UIElement,
+
+    /// Node adding
+    pub left_sidebar: UIRef,
+    pub left_sidebar_content: UIRef,
+    /// Node props
+    pub right_sidebar: UIRef,
+    pub right_sidebar_border: UIRef,
+    pub right_sidebar_content: UIRef,
+    /// Node editing area
+    pub graph_placeholder: UIRef,
+    pub graph_y_scrollbar: UIRef,
+    pub graph_x_scrollbar: UIRef,
+    //pub node_graph: NodeGraphUI,
+    //pub inspector_sidebar: InspectorSidebarUI,
+    pub last_mouse_pos: Vector2,
+    pub mouse_down_last_frame: bool,
+
+    // Element ref cache
+    pub functions: HashMap<hir::ItemId, UIRef>,
+    pub blocks: HashMap<hir::BlockId, BlockUI>,
+
+    pub placeholders: Vec<PlaceholderUI>,
+
+    header_font: Arc<WeakFont>,
 }
 
 impl UIContext {
-    pub fn new() -> UIContext {
-        UIContext {
-            add_node_popup: None,
-            node_graph: NodeGraphUI {
-                nodes: Default::default(),
-                currently_selected: Default::default(),
-                id_counter: Cell::new(0usize),
-            },
-            inspector_sidebar: InspectorSidebarUI {
-                width: 400f32,
-                is_border_clicked: false,
-            },
-        }
-    }
+    pub fn new(
+        rl: &mut RaylibHandle,
+        thread: &RaylibThread,
+        graph: hir::GraphId,
+        project: Arc<RefCell<hir::Project>>,
+    ) -> UIContext {
+        let mut root = UIElement::new(UIContent::None);
 
-    pub fn draw(&mut self, d: &mut RaylibDrawHandle, proj: &mut ProjectCtx) {
-        if d.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {
-            let res = self.consume_mouse_down(d.get_mouse_position(), d);
-            println!("mouse down consumed: {}", res);
-        }
-        if d.is_mouse_button_released(MouseButton::MOUSE_BUTTON_LEFT) {
-            let res = self.consume_mouse_up(d.get_mouse_position(), d);
-            println!("mouse up consumed: {}", res);
-        }
+        let mut left_sidebar = UIElement::new(UIContent::Rect(style::NAV_WINDOWING_DIM_BG))
+            .width(Sizing::Fixed(300f32))
+            .height(Sizing::Grow(None));
 
-        self.inspector_sidebar.update_width(d);
-        let graph_rect = Rectangle {
-            x: 0f32,
-            y: 0f32,
-            width: d.get_render_width() as f32 - self.inspector_sidebar.width,
-            height: d.get_render_height() as f32,
-        };
-        self.node_graph.draw(d, graph_rect, proj);
-        self.inspector_sidebar.draw(d, &self.node_graph);
-    }
-}
-
-impl UIClickable for UIContext {
-    fn consume_mouse_down(&mut self, click_pos: Vector2, d: &RaylibDrawHandle) -> bool {
-        self.inspector_sidebar.consume_mouse_down(click_pos, d)
-            || self.node_graph.consume_mouse_down(click_pos, d)
-    }
-
-    fn consume_mouse_up(&mut self, click_pos: Vector2, d: &RaylibDrawHandle) -> bool {
-        self.inspector_sidebar.consume_mouse_up(click_pos, d)
-            || self.node_graph.consume_mouse_up(click_pos, d)
-    }
-}
-
-pub type GraphNodeId = usize;
-
-pub struct NodeGraphUI {
-    nodes: RefCell<HashMap<GraphNodeId, Rc<RefCell<GraphNode>>>>,
-    currently_selected: RefCell<Weak<RefCell<GraphNode>>>,
-    id_counter: Cell<GraphNodeId>,
-}
-
-impl NodeGraphUI {
-    fn draw(&self, d: &mut RaylibDrawHandle, rect: Rectangle, proj: &ProjectCtx) {
-        d.draw_rectangle_rec(rect, GRAPH_BACKGROUND);
-        for (_id, node) in self.nodes.borrow().iter() {
-            node.borrow_mut().draw(d, self);
-        }
-    }
-
-    fn selected(&self) -> Option<Rc<RefCell<GraphNode>>> {
-        return self.currently_selected.borrow().upgrade();
-    }
-
-    fn set_selected(&self, node: Option<GraphNodeId>) {
-        //callbacks here?
-        *self.currently_selected.borrow_mut() = match node {
-            Some(id) => self
-                .nodes
-                .borrow()
-                .get(&id)
-                .map(|node| Rc::downgrade(node))
-                .unwrap_or(Weak::new()),
-            None => Weak::new(),
-        };
-    }
-
-    pub fn new_node(&self) -> Weak<RefCell<GraphNode>> {
-        let id = self.id_counter.get();
-        self.id_counter.set(id + 1);
-        let node = Rc::new(RefCell::new(GraphNode {
-            id,
-            pos: Vector2::new(0f32, 0f32),
-            is_clicked: false,
-        }));
-        let ret = Rc::downgrade(&node);
-        self.nodes.borrow_mut().insert(id, node);
-        ret
-    }
-}
-
-impl UIClickable for NodeGraphUI {
-    fn consume_mouse_down(&mut self, click_pos: Vector2, d: &RaylibDrawHandle) -> bool {
-        for (_id, node) in self.nodes.borrow().iter() {
-            let mut node = node.borrow_mut();
-            if node.consume_mouse_down(click_pos, d) {
-                self.set_selected(Some(node.id));
-                return true;
-            }
-        }
-        //self.set_selected(None);
-        false
-    }
-
-    fn consume_mouse_up(&mut self, click_pos: Vector2, d: &RaylibDrawHandle) -> bool {
-        for (_id, node) in self.nodes.borrow().iter() {
-            if node.borrow_mut().consume_mouse_up(click_pos, d) {
-                return true;
-            }
-        }
-        false
-    }
-}
-
-pub struct InspectorSidebarUI {
-    pub width: f32,
-    pub is_border_clicked: bool,
-}
-
-impl InspectorSidebarUI {
-    fn border_rect(&self, d: &RaylibDrawHandle) -> Rectangle {
-        let edge = d.get_render_width() as f32 - self.width;
-        Rectangle {
-            x: edge,
-            y: 0f32,
-            width: DRAG_BORDER_WIDTH as f32,
-            height: d.get_render_height() as f32,
-        }
-    }
-
-    fn background_rect(&self, d: &mut RaylibDrawHandle) -> Rectangle {
-        let edge = d.get_render_width() as f32 - self.width;
-        Rectangle {
-            x: edge,
-            y: 0f32,
-            width: self.width,
-            height: d.get_render_height() as f32,
-        }
-    }
-
-    fn update_width(&mut self, d: &mut RaylibDrawHandle) {
-        if self.is_border_clicked {
-            self.width += -d.get_mouse_delta().x;
-        }
-    }
-
-    fn draw(&mut self, d: &mut RaylibDrawHandle, graph: &NodeGraphUI) {
-        let area = self.background_rect(d);
-        d.draw_rectangle_rec(area, GUI_BACKGROUND);
-        let border = self.border_rect(d);
-        d.draw_rectangle_rec(border, BORDER_COLOR);
-
-        d.draw_text_ex(
-            d.get_font_default(),
-            "inspector",
-            Vector2::new(area.x + 12f32, area.y + 12f32),
-            20f32,
-            2f32,
-            Color::WHITE,
-        );
-
-        d.draw_text_ex(
-            d.get_font_default(),
-            format!(
-                "Currently selected: {}",
-                graph
-                    .selected()
-                    .map(|node| node.borrow().id.to_string())
-                    .unwrap_or("None".to_string())
+        let left_sidebar_content = left_sidebar
+            .add_child(
+                UIElement::new(UIContent::None)
+                    .width(Sizing::Grow(None))
+                    .height(Sizing::Grow(None))
+                    .build(),
             )
-            .as_str(),
-            Vector2::new(area.x + 12f32, area.y + 12f32 + 32f32),
-            20f32,
-            2f32,
-            Color::WHITE,
+            .upgrade()
+            .unwrap();
+
+        left_sidebar.add_child(
+            UIElement::new(UIContent::Rect(style::BUTTON))
+                .width(Sizing::Fixed(5f32))
+                .height(Sizing::Grow(None))
+                .build(),
         );
+
+        let left_sidebar = root.add_child(left_sidebar.build()).upgrade().unwrap();
+
+        let mut graph_area = UIElement::new(UIContent::None)
+            .width(Sizing::Grow(None))
+            .height(Sizing::Grow(None));
+
+        let mut graph_sub = UIElement::new(UIContent::None)
+            .width(Sizing::Grow(None))
+            .height(Sizing::Grow(None))
+            .direction(LayoutDir::Ascending);
+
+        let mut graph_x_scrollbar = UIElement::new(UIContent::Rect(style::WINDOW_BG))
+            .width(Sizing::Grow(None))
+            .uniform_padding(3f32);
+
+        graph_x_scrollbar.add_child(
+            UIElement::new(UIContent::Rounded {
+                color: style::BUTTON,
+                corner_radius: 4f32,
+            })
+            .width(Sizing::Grow(None))
+            .height(Sizing::Fixed(8f32))
+            .build(),
+        );
+
+        let graph_x_scrollbar = graph_sub
+            .add_child(graph_x_scrollbar.build())
+            .upgrade()
+            .unwrap();
+
+        let graph_placeholder = graph_sub
+            .add_child(
+                UIElement::new(UIContent::None)
+                    .width(Sizing::Grow(None))
+                    .height(Sizing::Grow(None))
+                    .build(),
+            )
+            .upgrade()
+            .unwrap();
+
+        graph_area.add_child(graph_sub.build());
+
+        let mut graph_y_scrollbar = UIElement::new(UIContent::Rect(style::WINDOW_BG))
+            .height(Sizing::Grow(None))
+            .uniform_padding(3f32);
+
+        graph_y_scrollbar.add_child(
+            UIElement::new(UIContent::Rounded {
+                color: style::BUTTON,
+                corner_radius: 4f32,
+            })
+            .height(Sizing::Grow(None))
+            .width(Sizing::Fixed(8f32))
+            .build(),
+        );
+
+        let graph_y_scrollbar = graph_area
+            .add_child(graph_y_scrollbar.build())
+            .upgrade()
+            .unwrap();
+
+        root.add_child(graph_area.build());
+
+        let mut right_sidebar = UIElement::new(UIContent::Rect(style::NAV_WINDOWING_DIM_BG))
+            .width(Sizing::Prefer {
+                target: 500f32,
+                min: Some(200f32),
+            })
+            .height(Sizing::Grow(None));
+
+        let right_sidebar_border = right_sidebar
+            .add_child(
+                UIElement::new(UIContent::Rect(style::BUTTON))
+                    .width(Sizing::Fixed(5f32))
+                    .height(Sizing::Grow(None))
+                    .build(),
+            )
+            .upgrade()
+            .unwrap();
+
+        let right_sidebar_content = right_sidebar
+            .add_child(
+                UIElement::new(UIContent::None)
+                    .width(Sizing::Grow(None))
+                    .height(Sizing::Grow(None))
+                    .build(),
+            )
+            .upgrade()
+            .unwrap();
+
+        let right_sidebar = root.add_child(right_sidebar.build()).upgrade().unwrap();
+
+        let root = root.build();
+
+        let graph_content =
+            UIElement::new(UIContent::Rect(style::NAV_WINDOWING_DIM_BG)).uniform_padding(15f32);
+
+        let graph_content = graph_content.build();
+
+        let header_font = Arc::new(
+            rl.load_font_ex(
+                &thread,
+                "fonts/JetBrains/JetBrainsMonoNerdFont-Bold.ttf",
+                30,
+                None,
+            )
+            .expect("Couldn't find font")
+            .make_weak(),
+        );
+
+        let ctx = UIContext {
+            root,
+            graph,
+            graph_content,
+            left_sidebar,
+            left_sidebar_content,
+            right_sidebar,
+            right_sidebar_content,
+            right_sidebar_border,
+            graph_placeholder,
+            graph_y_scrollbar,
+            graph_x_scrollbar,
+            last_mouse_pos: Vector2::new(0f32, 0f32),
+            mouse_down_last_frame: false,
+            functions: Default::default(),
+            blocks: Default::default(),
+            project,
+            header_font,
+            placeholders: Vec::new(),
+        };
+        ctx.init_events();
+        ctx
     }
-}
 
-impl UIClickable for InspectorSidebarUI {
-    fn consume_mouse_down(&mut self, click_pos: Vector2, d: &RaylibDrawHandle) -> bool {
-        self.is_border_clicked = self.border_rect(d).check_collision_point_rec(click_pos);
-        self.is_border_clicked
+    fn init_events(&self) {
+        self.right_sidebar_border.borrow_mut().on_event = Some({
+            let mut is_clicked = false;
+            let sidebar = Rc::downgrade(&self.right_sidebar);
+            let mut drag_width = 0f32;
+            Box::new(move |ui_event, in_bounds| {
+                match ui_event {
+                    UIEvent::MouseDown => {
+                        is_clicked = in_bounds;
+                        drag_width = sidebar.upgrade().unwrap().borrow().rect.width;
+                    }
+                    UIEvent::MouseUp => {
+                        if is_clicked {
+                            drag_width = sidebar.upgrade().unwrap().borrow().rect.width;
+                            let sidebar = sidebar.upgrade().unwrap();
+                            let mut sidebar = sidebar.borrow_mut();
+                            if let Sizing::Prefer {
+                                target: _,
+                                min: Some(min),
+                            } = sidebar.layout.width
+                            {
+                                sidebar.layout.width = Sizing::Prefer {
+                                    target: min.max(drag_width),
+                                    min: Some(min),
+                                };
+                            }
+                            is_clicked = false;
+                        }
+                    }
+                    UIEvent::MouseDrag(delta) => {
+                        println!("got drag event {:?}, will use = {}", delta, is_clicked);
+                        if is_clicked {
+                            let sidebar = sidebar.upgrade().unwrap();
+                            let mut sidebar = sidebar.borrow_mut();
+                            if let Sizing::Prefer {
+                                target: _,
+                                min: Some(min),
+                            } = sidebar.layout.width
+                            {
+                                drag_width -= delta.x;
+                                sidebar.layout.width = Sizing::Prefer {
+                                    target: min.max(drag_width),
+                                    min: Some(min),
+                                };
+                            } else {
+                                unreachable!()
+                            }
+                        }
+                    }
+                };
+                true
+            })
+        });
     }
 
-    fn consume_mouse_up(&mut self, _click_pos: Vector2, _d: &RaylibDrawHandle) -> bool {
-        self.is_border_clicked = false;
-        false
-    }
-}
-
-pub struct GraphNode {
-    pub id: GraphNodeId,
-    pub pos: Vector2,
-    pub is_clicked: bool,
-}
-
-impl GraphNode {
-    fn rect(&self, _d: &RaylibDrawHandle) -> Rectangle {
-        Rectangle {
-            x: self.pos.x,
-            y: self.pos.y,
-            width: 500f32,
-            height: 200f32,
+    pub fn draw(&mut self, d: &mut RaylibDrawHandle) {
+        let mouse_pos = d.get_mouse_position();
+        if d.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {
+            self.root.send_event(UIEvent::MouseDown, Some(mouse_pos));
+            self.graph_content
+                .send_event(UIEvent::MouseDown, Some(mouse_pos));
         }
-    }
-
-    fn draw(&mut self, d: &mut RaylibDrawHandle, graph: &NodeGraphUI) {
-        if d.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {}
         if d.is_mouse_button_released(MouseButton::MOUSE_BUTTON_LEFT) {
-            if self.is_clicked {
-                graph.set_selected(Some(self.id));
+            self.root.send_event(UIEvent::MouseUp, None);
+            self.graph_content.send_event(UIEvent::MouseUp, None);
+        }
+        let mouse_down = d.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT);
+        if mouse_down && self.mouse_down_last_frame {
+            let delta = d.get_mouse_position() - self.last_mouse_pos;
+            self.root
+                .send_event(UIEvent::MouseDrag(delta), Some(self.last_mouse_pos));
+            self.graph_content
+                .send_event(UIEvent::MouseDrag(delta), Some(self.last_mouse_pos));
+        }
+        self.mouse_down_last_frame = mouse_down;
+        self.last_mouse_pos = d.get_mouse_position();
+
+        // Update content
+        self.graph_content.children.clear();
+        {
+            let project = self.project.clone();
+            let project = project.borrow();
+            let graph = project.graph(self.graph).unwrap();
+            for item in graph.iter() {
+                use ::branec::hir::Item::*;
+                match item {
+                    Pipe(_) => todo!(),
+                    Trait(_) => todo!(),
+                    TraitImpl(_) => todo!(),
+                    Fn(function) => {
+                        let ui = self.get_fn_ui(function);
+                        self.graph_content.children.push(ui)
+                    }
+                }
             }
-            self.is_clicked = false;
         }
 
-        if self.is_clicked {
-            let delta = d.get_mouse_delta();
-            self.pos.x += delta.x;
-            self.pos.y += delta.y;
+        for (_id, graph_block) in self.blocks.iter_mut() {
+            graph_block.update_data(self.project.clone());
         }
 
-        let rect = self.rect(d);
-        d.draw_rectangle_rounded(rect, 0.2f32, 4, GUI_BACKGROUND);
+        self.root.layout.width = Sizing::Fixed(d.get_render_width() as f32);
+        self.root.layout.height = Sizing::Fixed(d.get_render_height() as f32);
+        self.root.compute_layout();
+
+        {
+            let gp = self.graph_placeholder.borrow();
+            self.graph_content.layout.width = Sizing::Fit(Some(gp.rect.width));
+            self.graph_content.layout.height = Sizing::Fit(Some(gp.rect.height));
+            self.graph_content.rect.x = gp.rect.x;
+            self.graph_content.rect.y = gp.rect.y;
+            self.graph_content.compute_layout();
+            self.graph_content.draw(d);
+
+            // Draw lines
+        }
+
+        self.root.draw(d);
+    }
+
+    fn get_fn_ui(&mut self, function: &hir::Fn) -> UIRef {
+        if let Some(ui) = self.functions.get(&function.id) {
+            ui.clone()
+        } else {
+            let mut fn_ui = UIElement::new(UIContent::Rounded {
+                color: style::FN_BACKGROUND,
+                corner_radius: 20f32,
+            })
+            .direction(LayoutDir::Decending)
+            .padding(BorderSizes {
+                left: 20f32,
+                top: 12f32,
+                right: 20f32,
+                bottom: 12f32,
+            });
+
+            fn_ui.add_child(
+                UIElement::new_text(
+                    self.header_font.clone(),
+                    function.ident.clone(),
+                    30f32,
+                    false,
+                    Color::WHITE,
+                )
+                .build(),
+            );
+
+            fn_ui.add_child_ref(self.get_block_ui(function.body));
+
+            let fn_ui = Rc::new(RefCell::new(fn_ui.build()));
+            self.functions.insert(function.id, fn_ui.clone());
+            fn_ui
+        }
+    }
+
+    fn get_block_ui(&mut self, block: hir::BlockId) -> UIRef {
+        if let Some(ui) = self.blocks.get(&block) {
+            return ui.root.clone();
+        }
+
+        let block_ui = BlockUI::new(block, self.graph, self.header_font.clone());
+        let ui = block_ui.root.clone();
+        self.blocks.insert(block, block_ui);
+        ui
     }
 }
 
-impl UIClickable for GraphNode {
-    fn consume_mouse_down(&mut self, click_pos: Vector2, d: &RaylibDrawHandle) -> bool {
-        self.is_clicked = self.rect(d).check_collision_point_rec(click_pos);
-        self.is_clicked
+pub struct BlockUI {
+    pub root: UIRef,
+    pub block: hir::BlockId,
+    pub graph_id: hir::GraphId,
+    /// Node ui element / what colum it's in
+    pub nodes: HashMap<hir::NodeId, UIRef>,
+    header_font: Arc<WeakFont>,
+}
+
+impl BlockUI {
+    pub fn new(block: hir::BlockId, graph_id: hir::GraphId, header_font: Arc<WeakFont>) -> Self {
+        let root = Rc::new(RefCell::new(
+            UIElement::new(UIContent::Rounded {
+                color: style::NAV_WINDOWING_DIM_BG,
+                corner_radius: 20f32,
+            })
+            .direction(LayoutDir::RightLeft)
+            .spacing(25f32)
+            .uniform_padding(10f32)
+            .height(Sizing::Fit(Some(100f32)))
+            .width(Sizing::Fit(Some(400f32)))
+            .build(),
+        ));
+
+        Self {
+            block,
+            graph_id,
+            root,
+            nodes: HashMap::new(),
+            header_font,
+        }
     }
 
-    fn consume_mouse_up(&mut self, _click_pos: Vector2, _d: &RaylibDrawHandle) -> bool {
-        self.is_clicked = false;
-        false
+    pub fn update_data(&mut self, proj: Arc<RefCell<hir::Project>>) {
+        self.root.borrow_mut().children.clear();
+
+        let p = proj.borrow();
+        let graph = p.graph(self.graph_id).unwrap();
+        let block = graph.block(self.block).unwrap();
+        println!("laying out nodes");
+        for (id, _node) in block.nodes.iter() {
+            let depth = queries::node_max_depth(*id, block);
+            println!("node {} depth was {:?}", id, depth);
+            let depth_index = match depth {
+                queries::NodeDepth::Orphaned(depth) => depth,
+                queries::NodeDepth::InTree(depth) => depth,
+            };
+            while depth_index >= { self.root.borrow().children.len() } {
+                self.root.borrow_mut().children.push(Rc::new(RefCell::new(
+                    UIElement::new(UIContent::None)
+                        .direction(LayoutDir::Decending)
+                        .spacing(10f32)
+                        .build(),
+                )))
+            }
+
+            let node_ui = self.get_node_ui(*id, block, proj.clone());
+            self.root.borrow_mut().children[depth_index]
+                .borrow_mut()
+                .children
+                .push(node_ui);
+        }
+    }
+
+    pub fn get_node_ui(
+        &mut self,
+        node_id: hir::NodeId,
+        block: &hir::Block,
+        proj: Arc<RefCell<hir::Project>>,
+    ) -> UIRef {
+        if let Some(ui) = self.nodes.get(&node_id) {
+            return ui.clone();
+        }
+
+        let node = block.nodes.get(&node_id).unwrap();
+
+        let mut ui = UIElement::new(UIContent::Rounded {
+            color: style::FN_BACKGROUND,
+            corner_radius: 15f32,
+        })
+        .uniform_padding(5f32);
+
+        ui.add_child(
+            UIElement::new_text(
+                self.header_font.clone(),
+                match proj.borrow().get_item(node.expr) {
+                    Some(item) => match item {
+                        hir::Item::Pipe(_) => todo!(),
+                        hir::Item::Fn(function) => function.ident.clone(),
+                        hir::Item::Trait(_) => todo!(),
+                        hir::Item::TraitImpl(trait_impl) => todo!(),
+                    },
+                    None => "broken ref".into(),
+                },
+                20f32,
+                false,
+                Color::WHITE,
+            )
+            .build(),
+        );
+
+        Rc::new(RefCell::new(ui.build()))
     }
 }

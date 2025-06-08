@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 raylib = "5.5.1"
 branec = { path = "BraneScript/compiler/branec" }
-salsa = "0.22.0"
 subsecond = "0.7.0-alpha.1"
 dioxus-devtools = "0.7.0-alpha.1"
 
