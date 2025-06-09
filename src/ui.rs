@@ -1,6 +1,6 @@
 use branec::{hir, queries};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     rc::{Rc, Weak},
     sync::Arc,
@@ -34,8 +34,8 @@ pub struct TextElementContent {
 
 #[derive(Clone, Copy, Debug)]
 pub enum UIEvent {
-    MouseDown,
-    MouseUp,
+    MouseDown(Vector2, MouseButton),
+    MouseUp(Vector2, MouseButton),
     MouseDrag(Vector2),
 }
 
@@ -720,20 +720,29 @@ impl UIElement {
         }
     }
 
-    pub fn send_event(&self, event: UIEvent, pos: Option<Vector2>) -> bool {
+    pub fn send_event(&mut self, event: UIEvent, pos: Option<Vector2>) -> bool {
         // TEMPORARY SOLUTION
         let mut targets = Vec::new();
         self.get_event_targets(&mut targets, pos);
-        println!("set event {:?}", event);
 
         for target in targets {
             let mut callback = { target.0.borrow_mut().on_event.take() }.unwrap();
             let consumed = (callback)(event, target.1);
             target.0.borrow_mut().on_event = Some(callback);
             if consumed {
-                println!("consumed event");
                 return true;
             }
+        }
+
+        if let Some(on_event) = &mut self.on_event {
+            (*on_event)(
+                event,
+                if let Some(pos) = pos {
+                    self.rect.check_collision_point_rec(pos)
+                } else {
+                    false
+                },
+            );
         }
         false
     }
@@ -833,6 +842,13 @@ impl UIElementBuilder {
     #[must_use]
     pub fn on_event(mut self, callback: impl FnMut(UIEvent, bool) -> bool + 'static) -> Self {
         self.on_event = Some(Box::new(callback));
+        self
+    }
+
+    #[must_use]
+    pub fn child(mut self, child: UIElement) -> Self {
+        let el = Rc::new(RefCell::new(child));
+        self.children.push(el);
         self
     }
 
@@ -953,9 +969,11 @@ pub struct UIContext {
 
     // Element ref cache
     pub functions: HashMap<hir::ItemId, UIRef>,
-    pub blocks: HashMap<hir::BlockId, BlockUI>,
+    pub blocks: HashMap<hir::BlockId, Rc<RefCell<BlockUI>>>,
 
     pub placeholders: Vec<PlaceholderUI>,
+
+    pub popup: Rc<AddBlockNodePopupCtx>,
 
     header_font: Arc<WeakFont>,
 }
@@ -967,6 +985,17 @@ impl UIContext {
         graph: hir::GraphId,
         project: Arc<RefCell<hir::Project>>,
     ) -> UIContext {
+        let header_font = Arc::new(
+            rl.load_font_ex(
+                &thread,
+                "fonts/JetBrains/JetBrainsMonoNerdFont-Bold.ttf",
+                30,
+                None,
+            )
+            .expect("Couldn't find font")
+            .make_weak(),
+        );
+
         let mut root = UIElement::new(UIContent::None);
 
         let mut left_sidebar = UIElement::new(UIContent::Rect(style::NAV_WINDOWING_DIM_BG))
@@ -1070,13 +1099,95 @@ impl UIContext {
             .upgrade()
             .unwrap();
 
-        let right_sidebar_content = right_sidebar
-            .add_child(
-                UIElement::new(UIContent::None)
-                    .width(Sizing::Grow(None))
-                    .height(Sizing::Grow(None))
-                    .build(),
+        let mut right_sidebar_content = UIElement::new(UIContent::None)
+            .align(LayoutAlign::Center)
+            .uniform_padding(10f32)
+            .width(Sizing::Grow(None))
+            .height(Sizing::Grow(None));
+
+        right_sidebar_content.add_child(
+            UIElement::new(UIContent::Rounded {
+                color: style::BUTTON,
+                corner_radius: 20f32,
+            })
+            .child(
+                UIElement::new_text(
+                    header_font.clone(),
+                    "Run".into(),
+                    40f32,
+                    false,
+                    Color::WHITE,
+                )
+                .build(),
             )
+            .on_event({
+                let project = project.clone();
+                move |event, in_bounds| match event {
+                    UIEvent::MouseDown(_, _) => false,
+                    UIEvent::MouseUp(_, mouse_button) => {
+                        if in_bounds && mouse_button == MouseButton::MOUSE_BUTTON_LEFT {
+                            //compile
+                            println!("COMPILING");
+                            match ::branec::lower_hir(&*project.borrow()) {
+                                Ok(modules) => {
+                                    println!("compiled modules:");
+
+                                    let backend =
+                                        ::brane_backend_llvm::LLVMJitBackend::new().unwrap();
+                                    for module in modules {
+                                        println!("{}", module);
+                                        println!("staging: {:#?}", backend.stage_module(module));
+                                    }
+                                    if let Err(err) = backend.process_modules() {
+                                        println!("error loading modules: {:?}", err);
+                                        return true;
+                                    }
+
+                                    println!("Loaded functions:");
+                                    let functions = backend.functions.read().unwrap();
+                                    for f in functions.iter() {
+                                        println!("{}", f.0)
+                                    }
+
+                                    let main_fn: fn(*const *mut u8, i32, f32, f32) -> f32 = unsafe {
+                                        std::mem::transmute(
+                                            *functions
+                                                .get("main")
+                                                .expect("didn't find main function"),
+                                        )
+                                    };
+
+                                    let mut stack_page = [0u32; u16::MAX as usize / 4];
+                                    let bindings_page =
+                                        [stack_page.as_mut_ptr() as *mut u8; u16::MAX as usize];
+
+                                    let ret = main_fn(bindings_page.as_ptr(), 0i32, 2f32, 2f32);
+                                    println!("return value: {}", ret);
+
+                                    println!("return values: ");
+                                    for i in 0..10 {
+                                        let ret = unsafe {
+                                            *((stack_page.as_mut_ptr() as *mut f32).add(i))
+                                        };
+                                        println!("{}", ret);
+                                    }
+                                }
+                                Err(err) => println!("Failed to compile: {:?}", err),
+                            };
+
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    UIEvent::MouseDrag(vector2) => false,
+                }
+            })
+            .build(),
+        );
+
+        let right_sidebar_content = right_sidebar
+            .add_child(right_sidebar_content.build())
             .upgrade()
             .unwrap();
 
@@ -1089,16 +1200,7 @@ impl UIContext {
 
         let graph_content = graph_content.build();
 
-        let header_font = Arc::new(
-            rl.load_font_ex(
-                &thread,
-                "fonts/JetBrains/JetBrainsMonoNerdFont-Bold.ttf",
-                30,
-                None,
-            )
-            .expect("Couldn't find font")
-            .make_weak(),
-        );
+        let popup = AddBlockNodePopupCtx::new(header_font.clone(), project.clone());
 
         let ctx = UIContext {
             root,
@@ -1119,6 +1221,7 @@ impl UIContext {
             project,
             header_font,
             placeholders: Vec::new(),
+            popup,
         };
         ctx.init_events();
         ctx
@@ -1129,74 +1232,96 @@ impl UIContext {
             let mut is_clicked = false;
             let sidebar = Rc::downgrade(&self.right_sidebar);
             let mut drag_width = 0f32;
-            Box::new(move |ui_event, in_bounds| {
-                match ui_event {
-                    UIEvent::MouseDown => {
+            Box::new(move |ui_event, in_bounds| match ui_event {
+                UIEvent::MouseDown(_, button) => {
+                    if button == MouseButton::MOUSE_BUTTON_LEFT {
                         is_clicked = in_bounds;
                         drag_width = sidebar.upgrade().unwrap().borrow().rect.width;
+                        in_bounds
+                    } else {
+                        false
                     }
-                    UIEvent::MouseUp => {
-                        if is_clicked {
-                            drag_width = sidebar.upgrade().unwrap().borrow().rect.width;
-                            let sidebar = sidebar.upgrade().unwrap();
-                            let mut sidebar = sidebar.borrow_mut();
-                            if let Sizing::Prefer {
-                                target: _,
+                }
+                UIEvent::MouseUp(_, button) => {
+                    if is_clicked && button == MouseButton::MOUSE_BUTTON_LEFT {
+                        drag_width = sidebar.upgrade().unwrap().borrow().rect.width;
+                        let sidebar = sidebar.upgrade().unwrap();
+                        let mut sidebar = sidebar.borrow_mut();
+                        if let Sizing::Prefer {
+                            target: _,
+                            min: Some(min),
+                        } = sidebar.layout.width
+                        {
+                            sidebar.layout.width = Sizing::Prefer {
+                                target: min.max(drag_width),
                                 min: Some(min),
-                            } = sidebar.layout.width
-                            {
-                                sidebar.layout.width = Sizing::Prefer {
-                                    target: min.max(drag_width),
-                                    min: Some(min),
-                                };
-                            }
-                            is_clicked = false;
+                            };
                         }
+                        is_clicked = false;
                     }
-                    UIEvent::MouseDrag(delta) => {
-                        println!("got drag event {:?}, will use = {}", delta, is_clicked);
-                        if is_clicked {
-                            let sidebar = sidebar.upgrade().unwrap();
-                            let mut sidebar = sidebar.borrow_mut();
-                            if let Sizing::Prefer {
-                                target: _,
-                                min: Some(min),
-                            } = sidebar.layout.width
-                            {
-                                drag_width -= delta.x;
-                                sidebar.layout.width = Sizing::Prefer {
-                                    target: min.max(drag_width),
-                                    min: Some(min),
-                                };
-                            } else {
-                                unreachable!()
-                            }
-                        }
+                    false
+                }
+                UIEvent::MouseDrag(delta) => {
+                    if is_clicked {
+                        let sidebar = sidebar.upgrade().unwrap();
+                        let mut sidebar = sidebar.borrow_mut();
+                        let Sizing::Prefer {
+                            target: _,
+                            min: Some(min),
+                        } = sidebar.layout.width
+                        else {
+                            unreachable!()
+                        };
+
+                        drag_width -= delta.x;
+                        sidebar.layout.width = Sizing::Prefer {
+                            target: min.max(drag_width),
+                            min: Some(min),
+                        };
                     }
-                };
-                true
+                    is_clicked
+                }
             })
         });
+    }
+
+    pub fn send_event(&mut self, event: UIEvent, pos: Option<Vector2>) -> bool {
+        let popup_res = { self.popup.send_event(event, pos) };
+        popup_res || self.root.send_event(event, pos) || self.graph_content.send_event(event, pos)
     }
 
     pub fn draw(&mut self, d: &mut RaylibDrawHandle) {
         let mouse_pos = d.get_mouse_position();
         if d.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {
-            self.root.send_event(UIEvent::MouseDown, Some(mouse_pos));
-            self.graph_content
-                .send_event(UIEvent::MouseDown, Some(mouse_pos));
+            self.send_event(
+                UIEvent::MouseDown(mouse_pos, MouseButton::MOUSE_BUTTON_LEFT),
+                Some(mouse_pos),
+            );
+        }
+
+        if d.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_RIGHT) {
+            self.send_event(
+                UIEvent::MouseDown(mouse_pos, MouseButton::MOUSE_BUTTON_RIGHT),
+                Some(mouse_pos),
+            );
         }
         if d.is_mouse_button_released(MouseButton::MOUSE_BUTTON_LEFT) {
-            self.root.send_event(UIEvent::MouseUp, None);
-            self.graph_content.send_event(UIEvent::MouseUp, None);
+            self.send_event(
+                UIEvent::MouseUp(mouse_pos, MouseButton::MOUSE_BUTTON_LEFT),
+                Some(mouse_pos),
+            );
         }
+        if d.is_mouse_button_released(MouseButton::MOUSE_BUTTON_RIGHT) {
+            self.send_event(
+                UIEvent::MouseUp(mouse_pos, MouseButton::MOUSE_BUTTON_RIGHT),
+                Some(mouse_pos),
+            );
+        }
+
         let mouse_down = d.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT);
         if mouse_down && self.mouse_down_last_frame {
             let delta = d.get_mouse_position() - self.last_mouse_pos;
-            self.root
-                .send_event(UIEvent::MouseDrag(delta), Some(self.last_mouse_pos));
-            self.graph_content
-                .send_event(UIEvent::MouseDrag(delta), Some(self.last_mouse_pos));
+            self.send_event(UIEvent::MouseDrag(delta), Some(self.last_mouse_pos));
         }
         self.mouse_down_last_frame = mouse_down;
         self.last_mouse_pos = d.get_mouse_position();
@@ -1222,7 +1347,7 @@ impl UIContext {
         }
 
         for (_id, graph_block) in self.blocks.iter_mut() {
-            graph_block.update_data(self.project.clone());
+            graph_block.borrow_mut().update_data(self.project.clone());
         }
 
         self.root.layout.width = Sizing::Fixed(d.get_render_width() as f32);
@@ -1238,10 +1363,15 @@ impl UIContext {
             self.graph_content.compute_layout();
             self.graph_content.draw(d);
 
-            // Draw lines
+            for (_id, graph_block) in self.blocks.iter_mut() {
+                graph_block
+                    .borrow_mut()
+                    .draw_node_connections(d, self.project.clone());
+            }
         }
 
         self.root.draw(d);
+        self.popup.draw(d);
     }
 
     fn get_fn_ui(&mut self, function: &hir::Fn) -> UIRef {
@@ -1271,7 +1401,7 @@ impl UIContext {
                 .build(),
             );
 
-            fn_ui.add_child_ref(self.get_block_ui(function.body));
+            fn_ui.add_child_ref(self.get_block_ui(function.body, &function.sig));
 
             let fn_ui = Rc::new(RefCell::new(fn_ui.build()));
             self.functions.insert(function.id, fn_ui.clone());
@@ -1279,76 +1409,427 @@ impl UIContext {
         }
     }
 
-    fn get_block_ui(&mut self, block: hir::BlockId) -> UIRef {
+    fn get_block_ui(&mut self, block: hir::BlockId, sig: &hir::BlockSig) -> UIRef {
         if let Some(ui) = self.blocks.get(&block) {
-            return ui.root.clone();
+            return ui.borrow().root.clone();
         }
 
-        let block_ui = BlockUI::new(block, self.graph, self.header_font.clone());
-        let ui = block_ui.root.clone();
+        let block_ui = BlockUI::new(
+            block,
+            sig,
+            self.graph,
+            self.header_font.clone(),
+            self.popup.clone(),
+            self.project.clone(),
+        );
+        let ui = block_ui.borrow().root.clone();
         self.blocks.insert(block, block_ui);
         ui
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GraphHandleId {
+    BlockOutput(usize),
+    BlockInput(usize),
+    NodeInput(hir::NodeId, usize),
+    NodeOutput(hir::NodeId, usize),
+}
+
+impl GraphHandleId {
+    pub fn is_input_source(self) -> bool {
+        match self {
+            GraphHandleId::BlockInput(_) | GraphHandleId::NodeOutput(_, _) => true,
+            GraphHandleId::NodeInput(_, _) | GraphHandleId::BlockOutput(_) => false,
+        }
+    }
+
+    pub fn is_output_sink(self) -> bool {
+        !self.is_input_source()
+    }
+
+    pub fn as_input_output(a: Self, b: Self) -> Option<(Self, Self)> {
+        if a.is_input_source() == b.is_input_source() {
+            return None;
+        }
+        if b.is_input_source() {
+            Some((b, a))
+        } else {
+            Some((a, b))
+        }
+    }
+
+    pub fn as_local_value(self) -> Option<hir::LocalValue> {
+        match self {
+            GraphHandleId::BlockOutput(_) => None,
+            GraphHandleId::BlockInput(index) => Some(hir::LocalValue::BlockInput { index }),
+            GraphHandleId::NodeInput(_, _) => None,
+            GraphHandleId::NodeOutput(node, index) => {
+                Some(hir::LocalValue::NodeOutput { node, index })
+            }
+        }
+    }
+}
+
 pub struct BlockUI {
     pub root: UIRef,
+    pub content: UIRef,
     pub block: hir::BlockId,
     pub graph_id: hir::GraphId,
     /// Node ui element / what colum it's in
-    pub nodes: HashMap<hir::NodeId, UIRef>,
+    pub nodes: HashMap<hir::NodeId, NodeUI>,
+    pub input_edges: Vec<GraphEdgeHandle>,
+    pub output_edges: Vec<GraphEdgeHandle>,
+    preview_drag: Option<GraphHandleId>,
     header_font: Arc<WeakFont>,
 }
 
 impl BlockUI {
-    pub fn new(block: hir::BlockId, graph_id: hir::GraphId, header_font: Arc<WeakFont>) -> Self {
-        let root = Rc::new(RefCell::new(
-            UIElement::new(UIContent::Rounded {
-                color: style::NAV_WINDOWING_DIM_BG,
-                corner_radius: 20f32,
-            })
-            .direction(LayoutDir::RightLeft)
-            .spacing(25f32)
-            .uniform_padding(10f32)
-            .height(Sizing::Fit(Some(100f32)))
-            .width(Sizing::Fit(Some(400f32)))
-            .build(),
-        ));
+    pub fn new(
+        block: hir::BlockId,
+        sig: &hir::BlockSig,
+        graph_id: hir::GraphId,
+        header_font: Arc<WeakFont>,
+        popup: Rc<AddBlockNodePopupCtx>,
+        proj: Arc<RefCell<hir::Project>>,
+    ) -> Rc<RefCell<Self>> {
+        let mut root = UIElement::new(UIContent::None).align(LayoutAlign::Center);
 
-        Self {
+        let mut inputs = UIElement::new(UIContent::None).direction(LayoutDir::Decending);
+        let mut outputs = UIElement::new(UIContent::None)
+            .direction(LayoutDir::Decending)
+            .align(LayoutAlign::End);
+
+        let mut input_edges = Vec::new();
+        let mut output_edges = Vec::new();
+
+        for input in sig.inputs.iter() {
+            let handle = make_edge_handle(
+                true,
+                input.ident.clone(),
+                style::BUTTON,
+                header_font.clone(),
+            );
+            inputs.add_child_ref(handle.root.clone());
+            input_edges.push(handle);
+        }
+
+        for output in sig.outputs.iter() {
+            let handle = make_edge_handle(
+                false,
+                output.ident.clone(),
+                style::BUTTON,
+                header_font.clone(),
+            );
+            outputs.add_child_ref(handle.root.clone());
+            output_edges.push(handle);
+        }
+
+        root.add_child(inputs.build());
+        let content = root
+            .add_child(
+                UIElement::new(UIContent::Rounded {
+                    color: style::NAV_WINDOWING_DIM_BG,
+                    corner_radius: 20f32,
+                })
+                .direction(LayoutDir::RightLeft)
+                .spacing(25f32)
+                .uniform_padding(10f32)
+                .height(Sizing::Fit(Some(100f32)))
+                .width(Sizing::Fit(Some(400f32)))
+                .build(),
+            )
+            .upgrade()
+            .unwrap();
+        root.add_child(outputs.build());
+
+        let root = Rc::new(RefCell::new(root.build()));
+
+        let block = Rc::new(RefCell::new(Self {
             block,
             graph_id,
             root,
+            content,
             nodes: HashMap::new(),
             header_font,
+            input_edges,
+            output_edges,
+            preview_drag: None,
+        }));
+
+        block.borrow_mut().root.borrow_mut().on_event = Some({
+            let block = Rc::downgrade(&block);
+            let proj = Arc::downgrade(&proj);
+            Box::new(move |ui_event, _in_bounds| {
+                let Some(block_ptr) = block.upgrade() else {
+                    return false;
+                };
+
+                let mut block = block_ptr.borrow_mut();
+                let Some(proj) = proj.upgrade() else {
+                    return false;
+                };
+                match ui_event {
+                    UIEvent::MouseDown(pos, button) => match button {
+                        MouseButton::MOUSE_BUTTON_LEFT => block.try_start_drag(pos),
+                        MouseButton::MOUSE_BUTTON_RIGHT => {
+                            popup.clear_menu();
+
+                            for (graph_id, graph) in proj.borrow().graphs.iter() {
+                                for item in graph.iter() {
+                                    match item {
+                                        hir::Item::Pipe(_) => (),
+                                        hir::Item::Fn(func) => {
+                                            popup.add_menu_item(func.ident.clone(), {
+                                                let proj = proj.clone();
+                                                let block = block_ptr.clone();
+                                                let graph_id = *graph_id;
+                                                let func_id = func.id;
+                                                move || {
+                                                    let block = block.borrow();
+                                                    let mut proj = proj.borrow_mut();
+                                                    let graph =
+                                                        proj.graph_mut(block.graph_id).unwrap();
+                                                    let block_data =
+                                                        graph.block_mut(block.block).unwrap();
+                                                    block_data.add_node(
+                                                        hir::DefId {
+                                                            graph: graph_id,
+                                                            item: func_id,
+                                                        },
+                                                        vec![],
+                                                    );
+                                                }
+                                            });
+                                        }
+                                        hir::Item::Trait(_) => (),
+                                        hir::Item::TraitImpl(_) => (),
+                                    }
+                                }
+                            }
+
+                            popup.show(pos);
+
+                            true
+                        }
+                        _ => false,
+                    },
+                    UIEvent::MouseUp(pos, button) => {
+                        if button == MouseButton::MOUSE_BUTTON_LEFT {
+                            if let Some(preview) = block.preview_drag.take() {
+                                if let Some(dropped_on) = block.get_handle_at(pos) {
+                                    if dropped_on != preview {
+                                        block.connect_edges(
+                                            preview,
+                                            dropped_on,
+                                            &mut *proj.borrow_mut(),
+                                        );
+                                    }
+                                } else {
+                                    block.set_local_value(
+                                        preview,
+                                        hir::LocalValue::BrokenRef,
+                                        &mut *proj.borrow_mut(),
+                                    );
+                                }
+
+                                if let Some(h) = block.get_handle_mut(preview) {
+                                    h.preview_pos = None;
+                                }
+                            }
+                        }
+                        false
+                    }
+                    UIEvent::MouseDrag(delta) => {
+                        if let Some(preview) = block.preview_drag {
+                            if let Some(h) = block.get_handle_mut(preview) {
+                                if let Some(pos) = &mut h.preview_pos {
+                                    *pos += delta;
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    }
+                }
+            })
+        });
+
+        block
+    }
+
+    fn connect_edges(
+        &mut self,
+        a: GraphHandleId,
+        b: GraphHandleId,
+        proj: &mut hir::Project,
+    ) -> bool {
+        let Some((input, output)) = GraphHandleId::as_input_output(a, b) else {
+            return false;
+        };
+
+        let local_value = input.as_local_value().unwrap();
+
+        self.set_local_value(output, local_value, proj)
+    }
+
+    fn set_local_value(
+        &mut self,
+        output: GraphHandleId,
+        value: hir::LocalValue,
+        proj: &mut hir::Project,
+    ) -> bool {
+        match output {
+            GraphHandleId::BlockOutput(output) => {
+                let graph = proj.graph_mut(self.graph_id).unwrap();
+                let block = graph.block_mut(self.block).unwrap();
+                while block.outputs.len() <= output {
+                    block.outputs.push(hir::LocalValue::BrokenRef);
+                }
+                block.outputs[output] = value;
+                true
+            }
+            GraphHandleId::NodeInput(node, input) => {
+                let graph = proj.graph_mut(self.graph_id).unwrap();
+                let block = graph.block_mut(self.block).unwrap();
+                let node = block.nodes.get_mut(&node).unwrap();
+                while node.inputs.len() <= input {
+                    node.inputs.push(hir::LocalValue::BrokenRef);
+                }
+                node.inputs[input] = value;
+                true
+            }
+            _ => false,
         }
     }
 
+    fn get_handle_at(&self, mouse_pos: Vector2) -> Option<GraphHandleId> {
+        for (i, input) in self.input_edges.iter().enumerate() {
+            if input
+                .handle
+                .borrow()
+                .rect
+                .check_collision_point_rec(mouse_pos)
+            {
+                return Some(GraphHandleId::BlockInput(i));
+            }
+        }
+
+        for (i, output) in self.output_edges.iter().enumerate() {
+            if output
+                .handle
+                .borrow()
+                .rect
+                .check_collision_point_rec(mouse_pos)
+            {
+                return Some(GraphHandleId::BlockOutput(i));
+            }
+        }
+
+        for (id, node) in self.nodes.iter() {
+            for (i, input) in node.input_edges.iter().enumerate() {
+                if input
+                    .handle
+                    .borrow()
+                    .rect
+                    .check_collision_point_rec(mouse_pos)
+                {
+                    return Some(GraphHandleId::NodeInput(*id, i));
+                }
+            }
+
+            for (i, output) in node.output_edges.iter().enumerate() {
+                if output
+                    .handle
+                    .borrow()
+                    .rect
+                    .check_collision_point_rec(mouse_pos)
+                {
+                    return Some(GraphHandleId::NodeOutput(*id, i));
+                }
+            }
+        }
+        None
+    }
+
+    fn get_handle(&self, id: GraphHandleId) -> Option<&GraphEdgeHandle> {
+        match id {
+            GraphHandleId::BlockOutput(i) => self.output_edges.get(i),
+            GraphHandleId::BlockInput(i) => self.input_edges.get(i),
+            GraphHandleId::NodeInput(node, i) => self
+                .nodes
+                .get(&node)
+                .map(|node| node.input_edges.get(i))
+                .flatten(),
+            GraphHandleId::NodeOutput(node, i) => self
+                .nodes
+                .get(&node)
+                .map(|node| node.output_edges.get(i))
+                .flatten(),
+        }
+    }
+
+    fn get_handle_mut(&mut self, id: GraphHandleId) -> Option<&mut GraphEdgeHandle> {
+        match id {
+            GraphHandleId::BlockOutput(i) => self.output_edges.get_mut(i),
+            GraphHandleId::BlockInput(i) => self.input_edges.get_mut(i),
+            GraphHandleId::NodeInput(node, i) => self
+                .nodes
+                .get_mut(&node)
+                .map(|node| node.input_edges.get_mut(i))
+                .flatten(),
+            GraphHandleId::NodeOutput(node, i) => self
+                .nodes
+                .get_mut(&node)
+                .map(|node| node.output_edges.get_mut(i))
+                .flatten(),
+        }
+    }
+
+    pub fn try_start_drag(&mut self, mouse_pos: Vector2) -> bool {
+        println!("Trying start drag");
+        let Some(handle_id) = self.get_handle_at(mouse_pos) else {
+            return false;
+        };
+        println!("Found handle");
+
+        self.preview_drag = Some(handle_id);
+        let handle = self.get_handle_mut(handle_id).unwrap();
+        handle.preview_pos = Some(mouse_pos);
+        true
+    }
+
     pub fn update_data(&mut self, proj: Arc<RefCell<hir::Project>>) {
-        self.root.borrow_mut().children.clear();
+        self.content.borrow_mut().children.clear();
 
         let p = proj.borrow();
         let graph = p.graph(self.graph_id).unwrap();
         let block = graph.block(self.block).unwrap();
-        println!("laying out nodes");
         for (id, _node) in block.nodes.iter() {
             let depth = queries::node_max_depth(*id, block);
-            println!("node {} depth was {:?}", id, depth);
             let depth_index = match depth {
                 queries::NodeDepth::Orphaned(depth) => depth,
                 queries::NodeDepth::InTree(depth) => depth,
             };
-            while depth_index >= { self.root.borrow().children.len() } {
-                self.root.borrow_mut().children.push(Rc::new(RefCell::new(
-                    UIElement::new(UIContent::None)
-                        .direction(LayoutDir::Decending)
-                        .spacing(10f32)
-                        .build(),
-                )))
+            while depth_index >= { self.content.borrow().children.len() } {
+                self.content
+                    .borrow_mut()
+                    .children
+                    .push(Rc::new(RefCell::new(
+                        UIElement::new(UIContent::None)
+                            .direction(LayoutDir::Decending)
+                            .spacing(10f32)
+                            .build(),
+                    )))
             }
 
             let node_ui = self.get_node_ui(*id, block, proj.clone());
-            self.root.borrow_mut().children[depth_index]
+            self.content.borrow_mut().children[depth_index]
                 .borrow_mut()
                 .children
                 .push(node_ui);
@@ -1362,36 +1843,408 @@ impl BlockUI {
         proj: Arc<RefCell<hir::Project>>,
     ) -> UIRef {
         if let Some(ui) = self.nodes.get(&node_id) {
-            return ui.clone();
+            return ui.root.clone();
+        }
+        let ui = NodeUI::new(node_id, block, self.header_font.clone(), proj.clone());
+        self.nodes.insert(node_id, ui);
+        self.get_node_ui(node_id, block, proj)
+    }
+
+    pub fn draw_node_connections(
+        &mut self,
+        d: &mut RaylibDrawHandle,
+        proj: Arc<RefCell<hir::Project>>,
+    ) {
+        let proj = proj.borrow();
+        let graph = proj.graph(self.graph_id).unwrap();
+        let block = graph.block(self.block).unwrap();
+
+        for (output_index, output) in block.outputs.iter().enumerate() {
+            let Some(end) = self.output_edges.get(output_index) else {
+                continue;
+            };
+
+            match output {
+                hir::LocalValue::BrokenRef => (),
+                hir::LocalValue::BlockInput { index } => {
+                    if let Some(start) = self.input_edges.get(*index) {
+                        Self::draw_connection(d, &start.handle, &end.handle, style::BUTTON);
+                    }
+                }
+                hir::LocalValue::NodeOutput { node, index } => {
+                    if let Some(start) = self
+                        .nodes
+                        .get(node)
+                        .map(|node| node.output_edges.get(*index))
+                        .flatten()
+                    {
+                        Self::draw_connection(d, &start.handle, &end.handle, style::BUTTON);
+                    }
+                }
+            }
         }
 
+        for (id, node) in self.nodes.iter() {
+            let Some(node_data) = block.nodes.get(id) else {
+                continue;
+            };
+            for (input_index, input) in node_data.inputs.iter().enumerate() {
+                let Some(end) = node.input_edges.get(input_index) else {
+                    continue;
+                };
+
+                match input {
+                    hir::LocalValue::BrokenRef => (),
+                    hir::LocalValue::BlockInput { index } => {
+                        if let Some(start) = self.input_edges.get(*index) {
+                            Self::draw_connection(d, &start.handle, &end.handle, style::BUTTON);
+                        }
+                    }
+                    hir::LocalValue::NodeOutput { node, index } => {
+                        if let Some(start) = self
+                            .nodes
+                            .get(node)
+                            .map(|node| node.output_edges.get(*index))
+                            .flatten()
+                        {
+                            Self::draw_connection(d, &start.handle, &end.handle, style::BUTTON);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(preview) = self.preview_drag {
+            let Some(handle) = self.get_handle(preview) else {
+                self.preview_drag = None;
+                println!("preview handle invalid");
+                return;
+            };
+            let start = handle.handle.borrow().rect;
+            let start = Vector2::new(start.x + start.width / 2f32, start.y + start.height / 2f32);
+            let Some(end) = &handle.preview_pos else {
+                self.preview_drag = None;
+                println!("preview pos not set");
+                return;
+            };
+
+            d.draw_line_bezier(start, end, 3f32, style::BUTTON);
+        }
+    }
+
+    fn draw_connection(d: &mut RaylibDrawHandle, start: &UIRef, end: &UIRef, color: Color) {
+        let start = start.borrow().rect;
+        let start = Vector2::new(start.x + start.width / 2f32, start.y + start.height / 2f32);
+        let end = end.borrow().rect;
+        let end = Vector2::new(end.x + end.width / 2f32, end.y + end.height / 2f32);
+        d.draw_line_bezier(start, end, 3f32, color);
+    }
+}
+
+pub struct NodeUI {
+    pub root: UIRef,
+    pub title: UIRef,
+    pub inputs: UIRef,
+    pub outputs: UIRef,
+    pub node: hir::NodeId,
+    pub input_edges: Vec<GraphEdgeHandle>,
+    pub output_edges: Vec<GraphEdgeHandle>,
+}
+
+pub struct GraphEdgeHandle {
+    pub root: UIRef,
+    pub ident: UIRef,
+    pub handle: UIRef,
+    pub preview_pos: Option<Vector2>,
+}
+
+impl NodeUI {
+    pub fn new(
+        node_id: hir::NodeId,
+        block: &hir::Block,
+        header_font: Arc<WeakFont>,
+        proj: Arc<RefCell<hir::Project>>,
+    ) -> Self {
         let node = block.nodes.get(&node_id).unwrap();
 
         let mut ui = UIElement::new(UIContent::Rounded {
             color: style::FN_BACKGROUND,
             corner_radius: 15f32,
         })
+        .direction(LayoutDir::Decending)
         .uniform_padding(5f32);
 
-        ui.add_child(
+        let proj = proj.borrow();
+        let (ident, sig) = match proj.get_item(node.expr) {
+            Some(item) => match item {
+                hir::Item::Pipe(_) => todo!(),
+                hir::Item::Fn(function) => (function.ident.clone(), Some(&function.sig)),
+                hir::Item::Trait(_) => todo!(),
+                hir::Item::TraitImpl(_) => todo!(),
+            },
+            None => ("broken ref".into(), None),
+        };
+
+        let title = ui
+            .add_child(
+                UIElement::new_text(
+                    header_font.clone(),
+                    ident.clone(),
+                    20f32,
+                    false,
+                    Color::WHITE,
+                )
+                .build(),
+            )
+            .upgrade()
+            .unwrap();
+
+        let mut connections = UIElement::new(UIContent::None);
+
+        let mut inputs = UIElement::new(UIContent::None).direction(LayoutDir::Decending);
+        let mut outputs = UIElement::new(UIContent::None)
+            .direction(LayoutDir::Decending)
+            .align(LayoutAlign::End);
+
+        let mut input_edges = Vec::new();
+        let mut output_edges = Vec::new();
+
+        if let Some(sig) = sig {
+            for input in sig.inputs.iter() {
+                let handle = make_edge_handle(
+                    false,
+                    input.ident.clone(),
+                    style::BUTTON,
+                    header_font.clone(),
+                );
+                inputs.add_child_ref(handle.root.clone());
+                input_edges.push(handle);
+            }
+
+            for output in sig.outputs.iter() {
+                let handle = make_edge_handle(
+                    true,
+                    output.ident.clone(),
+                    style::BUTTON,
+                    header_font.clone(),
+                );
+                outputs.add_child_ref(handle.root.clone());
+                output_edges.push(handle);
+            }
+        }
+
+        let inputs = connections.add_child(inputs.build()).upgrade().unwrap();
+        /*connections.add_child(
+            UIElement::new(UIContent::Rect(Color::RED))
+                .sizing(Sizing::Grow(None))
+                .build(),
+        );*/
+
+        let outputs = connections.add_child(outputs.build()).upgrade().unwrap();
+
+        ui.add_child(connections.build());
+
+        Self {
+            root: Rc::new(RefCell::new(ui.build())),
+            title,
+            inputs,
+            outputs,
+            node: node_id,
+            input_edges,
+            output_edges,
+        }
+    }
+
+    pub fn update_data(
+        &mut self,
+        block: &hir::Block,
+        header_font: Arc<WeakFont>,
+        proj: Arc<RefCell<hir::Project>>,
+    ) {
+        // TODO update title & edges
+    }
+}
+
+pub fn make_edge_handle(
+    swap: bool,
+    ident: String,
+    handle_color: Color,
+    font: Arc<WeakFont>,
+) -> GraphEdgeHandle {
+    let mut root = UIElement::new(UIContent::None)
+        .spacing(10f32)
+        .align(LayoutAlign::Center)
+        .sizing(Sizing::Fit(None));
+
+    let handle = Rc::new(RefCell::new(
+        UIElement::new(UIContent::Rounded {
+            color: handle_color,
+            corner_radius: 5f32,
+        })
+        .sizing(Sizing::Fixed(10f32))
+        .build(),
+    ));
+    let ident = Rc::new(RefCell::new(
+        UIElement::new_text(font, ident, 20f32, false, Color::WHITE).build(),
+    ));
+
+    let mut a = handle.clone();
+    let mut b = ident.clone();
+    if swap {
+        std::mem::swap(&mut a, &mut b);
+    }
+    root.add_child_ref(a);
+    root.add_child_ref(b);
+
+    let root = Rc::new(RefCell::new(root.build()));
+    GraphEdgeHandle {
+        root,
+        ident,
+        handle,
+        preview_pos: None,
+    }
+}
+
+struct AddBlockNodePopupCtx {
+    is_shown: Cell<bool>,
+    root: RefCell<UIElement>,
+    items: UIRef,
+    project: Arc<RefCell<hir::Project>>,
+    header_font: Arc<WeakFont>,
+}
+
+impl AddBlockNodePopupCtx {
+    pub fn new(header_font: Arc<WeakFont>, project: Arc<RefCell<hir::Project>>) -> Rc<Self> {
+        let mut root = UIElement::new(UIContent::Rounded {
+            color: style::BUTTON,
+            corner_radius: 20f32,
+        })
+        .uniform_padding(4f32);
+
+        let mut content = UIElement::new(UIContent::Rounded {
+            color: style::NAV_WINDOWING_DIM_BG,
+            corner_radius: 20f32,
+        })
+        .uniform_padding(5f32)
+        .direction(LayoutDir::Decending);
+
+        content.add_child(
             UIElement::new_text(
-                self.header_font.clone(),
-                match proj.borrow().get_item(node.expr) {
-                    Some(item) => match item {
-                        hir::Item::Pipe(_) => todo!(),
-                        hir::Item::Fn(function) => function.ident.clone(),
-                        hir::Item::Trait(_) => todo!(),
-                        hir::Item::TraitImpl(trait_impl) => todo!(),
-                    },
-                    None => "broken ref".into(),
-                },
-                20f32,
+                header_font.clone(),
+                "Add Item".into(),
+                30f32,
                 false,
                 Color::WHITE,
             )
             .build(),
         );
+        // Seperator
+        content.add_child(
+            UIElement::new(UIContent::Rounded {
+                color: style::BUTTON,
+                corner_radius: 1f32,
+            })
+            .height(Sizing::Fixed(2f32))
+            .width(Sizing::Grow(None))
+            .build(),
+        );
 
-        Rc::new(RefCell::new(ui.build()))
+        let items = content
+            .add_child(
+                UIElement::new(UIContent::None)
+                    .direction(LayoutDir::Decending)
+                    .build(),
+            )
+            .upgrade()
+            .unwrap();
+
+        root.add_child(content.build());
+
+        let root = RefCell::new(root.build());
+
+        let ctx = Rc::new(Self {
+            is_shown: Cell::new(false),
+            items,
+            root,
+            project,
+            header_font,
+        });
+
+        ctx.root.borrow_mut().on_event = Some({
+            let ctx = Rc::downgrade(&ctx);
+            Box::new(move |event, in_bounds| {
+                let Some(ctx) = ctx.upgrade() else {
+                    return false;
+                };
+                match event {
+                    UIEvent::MouseDown(_, _) => {
+                        let was_shown = ctx.is_shown.get();
+                        ctx.is_shown.set(false);
+                        println!("hiding popup");
+                        was_shown && in_bounds
+                    }
+                    UIEvent::MouseUp(_, _) => false,
+                    UIEvent::MouseDrag(_) => false,
+                }
+            })
+        });
+
+        ctx
+    }
+
+    pub fn show(&self, pos: Vector2) {
+        self.is_shown.set(true);
+        let mut root = self.root.borrow_mut();
+        root.rect.x = pos.x;
+        root.rect.y = pos.y;
+        root.compute_layout();
+        // TODO windows bounds checking
+    }
+
+    pub fn draw(&self, d: &mut RaylibDrawHandle) {
+        if self.is_shown.get() {
+            let mut root = self.root.borrow_mut();
+            root.compute_layout();
+            root.draw(d);
+        }
+    }
+
+    pub fn send_event(&self, event: UIEvent, pos: Option<Vector2>) -> bool {
+        if self.is_shown.get() {
+            self.root.borrow_mut().send_event(event, pos)
+        } else {
+            false
+        }
+    }
+
+    pub fn clear_menu(&self) {
+        self.items.borrow_mut().children.clear();
+    }
+
+    pub fn add_menu_item(&self, label: String, mut on_click: impl FnMut() + 'static) {
+        let mut item = UIElement::new(UIContent::Rounded {
+            color: style::NAV_WINDOWING_DIM_BG.lerp(Color::WHITE, 0.1f32),
+            corner_radius: 20f32,
+        })
+        .on_event(move |event, in_bounds| match event {
+            UIEvent::MouseDown(_vector2, mouse_button) => {
+                if in_bounds && mouse_button == MouseButton::MOUSE_BUTTON_LEFT {
+                    on_click();
+                }
+                // Click event gets consumed by root node
+                false
+            }
+            _ => false,
+        });
+
+        item.add_child(
+            UIElement::new_text(self.header_font.clone(), label, 20f32, false, Color::WHITE)
+                .build(),
+        );
+
+        self.items
+            .borrow_mut()
+            .children
+            .push(Rc::new(RefCell::new(item.build())));
     }
 }
